@@ -1,0 +1,24 @@
+.{
+    .name = .r4os_updsvc,
+    .version = "0.2.13",
+    .fingerprint = 0x35591db65d062b63,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .r4os_sdk = .{
+            .url = "https://github.com/R4OSDev/r4os-sdk/archive/74d2e31dfbcf2bb8531cac44f91200f5c31947b4.tar.gz",
+            .hash = "r4os_sdk-0.64.17-NnPzAolu7gDVNAakB-ik3ZS5kDAE9nC-0AUv4_aIqe2H",
+        },
+        .r4os_libraries = .{
+            .url = "https://github.com/R4OSDev/r4os-libraries/archive/506155df353addba5dd164713175f8ab875b0f91.tar.gz",
+            .hash = "r4os_libraries-0.64.17-dH4fNVbvhgA-J5nvsY2C4Aw4SBMh1kNKc_-X0uRRR1vU",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "module.R4MF",
+        "README.txt",
+        "PROVENANCE.txt",
+    },
+}

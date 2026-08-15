@@ -1,0 +1,7 @@
+﻿# UpdateService repository path mappings. Relative to this repository root.
+SDK_ROOT=../../SDK
+CONTRACT_ROOT=../../Contract
+LIBRARIES_ROOT=../../Libraries
+DEVKIT_ROOT=../../../DevKit
+ARTIFACTS_ROOT=../../../Artifacts/Modules/UpdateService
+ZIG_ROOT=Toolchains/Zig
