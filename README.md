@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.2.13`
+- Version: `0.2.14`
 - Image target: `/R4OS/SERVICES/UPDSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`

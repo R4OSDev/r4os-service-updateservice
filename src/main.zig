@@ -14,7 +14,6 @@ const staged_root: [*:0]const u8 = "C:\\R4OS\\UPDATE\\STAGED";
 const inbox_root: [*:0]const u8 = "C:\\R4OS\\UPDATE\\INBOX";
 const inbox_prefix = "C:\\R4OS\\UPDATE\\INBOX\\";
 const worker_stack_bytes: u64 = 512 * 1024;
-const endpoint_wait_ns: u64 = 1_000_000;
 const config_capacity: usize = 4096;
 const state_capacity: usize = 2048;
 const release_capacity: usize = 1024;
@@ -154,19 +153,20 @@ fn runService(app: *r4os.App) i32 {
     };
 
     ctx.println("UPDSVC ready endpoint=UPDSVC worker=1 contract=1");
-    while (!ctx.programShouldClose()) {
-        switch (endpoint.wait(r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(endpoint_wait_ns)))) {
-            .ready => {
-                const rc = handleRequest(&ctx, &endpoint);
-                if (rc < 0) {
-                    _ = endpoint.unregister();
-                    @atomicStore(u32, &runtime.shutdown, 1, .release);
-                    runtime.stop.request();
-                    _ = worker.join(r4os.time_contract.timeoutForever());
-                    return rc;
-                }
+    var service_loop = r4os.ServiceLoop.init(ctx, endpoint.raw, .{});
+    while (true) {
+        switch (service_loop.wait(null)) {
+            .requests => |pending| {
+                const rc = service_loop.drain(pending, handleRequest, .{ &ctx, &endpoint });
+                if (rc >= 0) continue;
+                _ = endpoint.unregister();
+                @atomicStore(u32, &runtime.shutdown, 1, .release);
+                runtime.stop.request();
+                _ = worker.join(r4os.time_contract.timeoutForever());
+                return rc;
             },
-            .timed_out => {},
+            .idle, .deadline => {},
+            .stop => break,
             .failure => |raw| {
                 @atomicStore(u32, &runtime.shutdown, 1, .release);
                 runtime.stop.request();
@@ -176,6 +176,7 @@ fn runService(app: *r4os.App) i32 {
         }
     }
 
+    service_loop.report(std.mem.span(contract.service_name));
     runtime.coordinator.stop();
     runtime.stop.request();
     @atomicStore(u32, &runtime.shutdown, 1, .release);
