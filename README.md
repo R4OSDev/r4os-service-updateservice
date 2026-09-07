@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.2.14`
+- Version: `0.2.15`
 - Image target: `/R4OS/SERVICES/UPDSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -28,6 +28,12 @@ last verified standalone dependency identities; workspace builds use the
 mapped local checkouts.
 
 ## Documentation
+
+Downloads hash sink bytes during transfer and verify the published file once.
+Resume rehashes only the retained prefix before continuing. Result operations
+10/11 bundle each offer with its first component and up to eight subsequent
+components per page, bound to one job and result generation. Existing result
+operations remain available for older clients.
 
 Detailed German technical notes from the migration are preserved in
 `DOCUMENTATION.de.txt`. Source-transfer provenance is recorded in

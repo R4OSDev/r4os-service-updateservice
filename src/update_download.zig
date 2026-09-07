@@ -187,6 +187,37 @@ pub fn partialAction(expected_size: u64, observed_size: ?u64) PartialAction {
 /// Liest exakt die erwartete Dateilaenge und prueft zusaetzlich ein Byte
 /// dahinter. Zu kurze und zu lange Dateien koennen dadurch nicht denselben
 /// Hashpfad wie ein gueltiges Paket erreichen.
+pub const TransferDigest = struct {
+    hasher: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    bytes: u64 = 0,
+
+    // A resumed transfer reads only its retained prefix. New bytes enter the
+    // digest from the successful download sink, without rereading the PART.
+    pub fn prefix(self: *TransferDigest, reader: anytype, path: [*:0]const u8, size: u64, scratch: []u8) bool {
+        if (self.bytes != 0 or size > std.math.maxInt(u32) or scratch.len == 0) return false;
+        while (self.bytes < size) {
+            const count: usize = @intCast(@min(scratch.len, size - self.bytes));
+            const got = reader.fileReadAt(path, @intCast(self.bytes), scratch[0..count]);
+            if (got <= 0 or got > count) return false;
+            self.append(scratch[0..@intCast(got)]);
+        }
+        return true;
+    }
+
+    pub fn append(self: *TransferDigest, bytes: []const u8) void {
+        self.hasher.update(bytes);
+        self.bytes += bytes.len;
+    }
+
+    pub fn matches(self: *const TransferDigest, size: u64, expected: []const u8) bool {
+        if (self.bytes != size or !validSha256(expected)) return false;
+        var hasher = self.hasher;
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        return std.ascii.eqlIgnoreCase(&std.fmt.bytesToHex(digest, .lower), expected);
+    }
+};
+
 pub fn verifyReader(reader: anytype, path: [*:0]const u8, expected_size: u64, expected_sha256: []const u8, scratch: []u8) bool {
     if (expected_size == 0 or expected_size > std.math.maxInt(u32) or scratch.len == 0 or !validSha256(expected_sha256)) return false;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -307,6 +338,19 @@ test "size and SHA256 bind the final package after resume" {
     try std.testing.expect(!verifyReader(&corrupt, "X", 3, fixtureRecord().sha256Text(), scratch[0..]));
     try std.testing.expect(!verifyReader(&short, "X", 3, fixtureRecord().sha256Text(), scratch[0..]));
     try std.testing.expect(!verifyReader(&long, "X", 3, fixtureRecord().sha256Text(), scratch[0..]));
+    for (0..4) |boundary| {
+        var transfer = TransferDigest{};
+        try std.testing.expect(transfer.prefix(&good, "X", boundary, &scratch));
+        transfer.append("abc"[boundary..]);
+        try std.testing.expect(transfer.matches(3, fixtureRecord().sha256Text()));
+        try std.testing.expect(!transfer.matches(4, fixtureRecord().sha256Text()));
+    }
+    var corrupt_transfer = TransferDigest{};
+    try std.testing.expect(corrupt_transfer.prefix(&good, "X", 2, &scratch));
+    corrupt_transfer.append("d");
+    try std.testing.expect(!corrupt_transfer.matches(3, fixtureRecord().sha256Text()));
+    var incomplete = TransferDigest{};
+    try std.testing.expect(!incomplete.prefix(&short, "X", 3, &scratch));
 }
 
 test "fixture restart resumes an 11 MB package byte exactly at multiple boundaries" {

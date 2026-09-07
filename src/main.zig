@@ -79,6 +79,7 @@ const Runtime = struct {
     shutdown: u32 = 0,
     persist_lock: u32 = 0,
     results_lock: u32 = 0,
+    results_generation: u32 = 1,
     results: SearchResults = .{},
     download: DownloadRuntime = .{},
     prepared_restart: bool = false,
@@ -227,6 +228,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint
         contract.op_cancel => replyCancel(ctx, endpoint, message.header.request_id, body),
         contract.op_results => replyResults(ctx, endpoint, message.header.request_id, body),
         contract.op_components => replyComponents(ctx, endpoint, message.header.request_id, body),
+        contract.op_results_bundle, contract.op_component_batch => replyBatchedResults(endpoint, message.header.request_id, message.header.op, body),
         else => endpoint.reply(message.header.request_id, r4os.abi.service_api_result_bad_op, ""),
     };
 }
@@ -406,6 +408,7 @@ fn replyDownloadSubmit(
         discardPart(ctx, &runtime.download.record);
     runtime.download.record = candidate;
     runtime.download.valid = true;
+    resultsChanged();
     runtime.results.offer_states[request.result_index] = @intFromEnum(contract.State.downloading);
     runtime.results.offer_results[request.result_index] = contract.result_ok;
     runtime.results.offer_progress[request.result_index] = 0;
@@ -417,6 +420,7 @@ fn replyDownloadSubmit(
     if (!markDurableBlocking(ctx, ack.job_id, persisted)) {
         ack.result = contract.result_persist_failed;
         ack.state = @intFromEnum(contract.State.failed);
+        resultsChanged();
         runtime.results.offer_states[request.result_index] = @intFromEnum(contract.State.failed);
         runtime.results.offer_results[request.result_index] = contract.result_persist_failed;
     } else if (runtime.coordinator.snapshot()) |durable| {
@@ -520,6 +524,77 @@ fn replyComponents(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoi
     return endpoint.replyTyped(contract.ComponentPage, request_id, r4os.abi.service_api_result_ok, &page);
 }
 
+fn replyBatchedResults(endpoint: *r4os.ServiceEndpoint, request_id: u32, op: u16, body: []const u8) i32 {
+    const request = decodeStruct(contract.PageRequest, body) orelse
+        return endpoint.reply(request_id, contract.result_invalid, "");
+    if (!request.header.valid(@sizeOf(contract.PageRequest)) or request.job_id == 0 or
+        (request.generation == 0 and (op != contract.op_results_bundle or request.result_index != 0)))
+        return endpoint.reply(request_id, contract.result_invalid, "");
+    if (!tryAcquireResultsLock()) return endpoint.reply(request_id, contract.result_busy, "");
+    var locked = true;
+    defer if (locked) releaseResultsLock();
+    if (runtime.results.job_id != request.job_id or
+        (request.generation != 0 and request.generation != runtime.results_generation))
+        return endpoint.reply(request_id, contract.result_selection_stale, "");
+    const generation = runtime.results_generation;
+    const total = runtime.results.plan.package_count;
+    if (op == contract.op_results_bundle) {
+        if (request.component_index != 0 or request.result_index > total)
+            return endpoint.reply(request_id, contract.result_invalid, "");
+        var bundle = contract.ResultsBundle{ .page = .{
+            .job_id = request.job_id,
+            .generation = generation,
+            .total = @intCast(total),
+            .index = request.result_index,
+            .flags = contract.flag_results_ready |
+                (if (runtime.results.plan.restart_required) contract.flag_restart_required else 0),
+        } };
+        const page = &bundle.page;
+        page.current_release_len = @intCast(copyFixed(&page.current_release, runtime.results.current_release[0..runtime.results.current_release_len]));
+        if (request.result_index < total) {
+            if (!fillOffer(&page.offer, request.result_index))
+                return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+            page.has_offer = 1;
+            if (page.offer.component_count != 0) {
+                const index = runtime.results.plan.packageIndex(request.result_index) orelse
+                    return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+                if (!fillComponent(&bundle.first_component, &runtime.results.release.packages[index], 0))
+                    return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+            }
+        }
+        releaseResultsLock();
+        locked = false;
+        return endpoint.replyTyped(contract.ResultsBundle, request_id, contract.result_ok, &bundle);
+    }
+    const index = runtime.results.plan.packageIndex(request.result_index) orelse
+        return endpoint.reply(request_id, contract.result_not_found, "");
+    if (index >= runtime.results.release.package_count)
+        return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+    const package = &runtime.results.release.packages[index];
+    if (request.component_index >= package.component_count)
+        return endpoint.reply(request_id, contract.result_invalid, "");
+    var batch = contract.ComponentBatch{
+        .job_id = request.job_id,
+        .generation = generation,
+        .result_index = request.result_index,
+        .component_index = request.component_index,
+        .total = package.component_count,
+        .count = @intCast(@min(contract.component_batch_capacity, package.component_count - request.component_index)),
+    };
+    for (batch.components[0..batch.count], 0..) |*component, i| {
+        if (!fillComponent(component, package, request.component_index + i))
+            return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+    }
+    releaseResultsLock();
+    locked = false;
+    return endpoint.replyTyped(contract.ComponentBatch, request_id, contract.result_ok, &batch);
+}
+
+fn resultsChanged() void {
+    runtime.results_generation +%= 1;
+    if (runtime.results_generation == 0) runtime.results_generation = 1;
+}
+
 fn workerMain(arg: u64) callconv(.c) i32 {
     const state: *Runtime = @ptrFromInt(arg);
     const app = state.app orelse return 1;
@@ -554,6 +629,7 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
     if (!tryAcquireResultsLock()) return searchFailure(contract.result_busy, "results-busy");
     var results_locked = true;
     defer if (results_locked) releaseResultsLock();
+    resultsChanged();
     state.results.job_id = 0;
     state.results.catalog_len = 0;
     state.results.inventory_len = 0;
@@ -588,6 +664,7 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
         return searchFailure(contract.result_inventory_invalid, "release-invalid");
     state.results.current_release_len = copyFixed(state.results.current_release[0..], local_release);
 
+    resultsChanged();
     const inventory_read = ctx.fileRead("C:\\R4OS\\CONFIG\\MODULES.JSON", state.results.inventory_bytes[0..]);
     if (inventory_read <= 0 or inventory_read > @as(i32, @intCast(state.results.inventory_bytes.len)))
         return searchFailure(contract.result_inventory_invalid, "inventory-missing");
@@ -792,6 +869,7 @@ const DownloadFlow = struct {
     job_id: u32,
     current: u64,
     last_checkpoint: u64,
+    digest: *update_download.TransferDigest,
     persist_failed: bool = false,
 
     fn write(raw: ?*anyopaque, offset: u64, bytes: []const u8) bool {
@@ -800,6 +878,7 @@ const DownloadFlow = struct {
             return false;
         const written = self.ctx.fileAppend(self.paths.part.asZ().ptr, bytes);
         if (written < 0 or @as(usize, @intCast(written)) != bytes.len) return false;
+        self.digest.append(bytes);
         self.current += bytes.len;
         self.state.download.record.progress = self.current;
         return true;
@@ -872,6 +951,9 @@ fn executeDownload(app: *r4os.App, state: *Runtime, work: *const core.Work) core
     if (!persistDownloadRecord(&ctx, &state.download.record))
         return downloadFailure(&ctx, state, contract.result_persist_failed, "download-state-persist-failed", false);
 
+    var digest = update_download.TransferDigest{};
+    if (!digest.prefix(&ctx, paths.part.asZ().ptr, resume_from, &state.download.hash_scratch))
+        return downloadFailure(&ctx, state, contract.result_integrity_failed, "partial-read-failed", false);
     if (resume_from < state.download.record.expected_size) {
         var web = app.web() orelse return downloadFailure(&ctx, state, contract.result_network_failed, "web-unavailable", false);
         var flow = DownloadFlow{
@@ -881,6 +963,7 @@ fn executeDownload(app: *r4os.App, state: *Runtime, work: *const core.Work) core
             .job_id = work.job_id,
             .current = resume_from,
             .last_checkpoint = resume_from,
+            .digest = &digest,
         };
         const result = web.download(
             state.download.record.urlText(),
@@ -942,12 +1025,13 @@ fn executeDownload(app: *r4os.App, state: *Runtime, work: *const core.Work) core
         state.download.record.progress = 0;
         return downloadFailure(&ctx, state, contract.result_integrity_failed, "download-size-invalid", false);
     }
-    if (!update_download.verifyReader(&ctx, paths.part.asZ().ptr, state.download.record.expected_size, state.download.record.sha256Text(), state.download.hash_scratch[0..])) {
+    if (!digest.matches(state.download.record.expected_size, state.download.record.sha256Text())) {
         _ = ctx.fileDelete(paths.part.asZ().ptr);
         state.download.record.progress = 0;
         return downloadFailure(&ctx, state, contract.result_integrity_failed, "download-sha256-invalid", false);
     }
-
+    // Bind the single post-transfer SHA-256 pass to the published object. Success is not
+    // exposed until that exact final path passes the catalog digest check.
     _ = ctx.fileDelete(paths.backup.asZ().ptr);
     const published = files.replaceAtomic(
         paths.final.asZ(),
@@ -1069,10 +1153,12 @@ fn hydrateDownloadedOffers(ctx: *const r4os.r4sys.Context, state: *Runtime) void
             package.sha256,
             state.download.hash_scratch[0..],
         )) {
+            resultsChanged();
             state.results.offer_states[result_index] = @intFromEnum(contract.State.downloaded);
             state.results.offer_results[result_index] = contract.result_ok;
             state.results.offer_progress[result_index] = package.size;
         } else {
+            resultsChanged();
             state.results.offer_states[result_index] = @intFromEnum(contract.State.failed);
             state.results.offer_results[result_index] = contract.result_integrity_failed;
             state.results.offer_progress[result_index] = 0;
@@ -1119,6 +1205,7 @@ fn updateOfferState(
         if (tryAcquireResultsLock()) {
             defer releaseResultsLock();
             if (runtime.results.job_id == record.search_job_id and record.result_index < runtime.results.plan.package_count) {
+                resultsChanged();
                 runtime.results.offer_states[record.result_index] = switch (state) {
                     .available => @intFromEnum(contract.State.available),
                     .downloading => @intFromEnum(contract.State.downloading),
@@ -1147,6 +1234,7 @@ fn setOfferContractState(
         if (tryAcquireResultsLock()) {
             defer releaseResultsLock();
             if (runtime.results.job_id == search_job_id and result_index < runtime.results.plan.package_count) {
+                resultsChanged();
                 runtime.results.offer_states[result_index] = @intFromEnum(state);
                 runtime.results.offer_results[result_index] = result;
                 runtime.results.offer_progress[result_index] = progress;
@@ -1504,6 +1592,7 @@ fn targetReleaseReached(app: *r4os.App, state: *Runtime) bool {
         ctx.sleepTicks(1);
     }
     defer releaseResultsLock();
+    resultsChanged();
     const inventory_read = ctx.fileRead("C:\\R4OS\\CONFIG\\MODULES.JSON", state.results.inventory_bytes[0..]);
     if (inventory_read <= 0 or inventory_read > @as(i32, @intCast(state.results.inventory_bytes.len))) return false;
     state.results.inventory_len = @intCast(inventory_read);
