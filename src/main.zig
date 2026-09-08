@@ -229,7 +229,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint
         contract.op_results => replyResults(ctx, endpoint, message.header.request_id, body),
         contract.op_components => replyComponents(ctx, endpoint, message.header.request_id, body),
         contract.op_results_bundle, contract.op_component_batch => replyBatchedResults(endpoint, message.header.request_id, message.header.op, body),
-        else => endpoint.reply(message.header.request_id, r4os.abi.service_api_result_bad_op, ""),
+        else => endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_bad_op, ""),
     };
 }
 
@@ -240,19 +240,19 @@ fn replyStatus(
     body: []const u8,
 ) i32 {
     const request = decodeStruct(contract.StatusRequest, body) orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (!request.header.valid(@sizeOf(contract.StatusRequest)))
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     var status = runtime.coordinator.snapshot() orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_busy, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_busy, "");
     if (request.job_id != 0 and request.job_id != status.job_id)
-        return endpoint.reply(request_id, r4os.abi.service_api_result_not_found, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_not_found, "");
     if (runtime.download.valid and (status.operation == contract.op_download or status.operation == contract.op_install)) {
         status.source_job_id = runtime.download.record.search_job_id;
         status.result_index = runtime.download.record.result_index;
     }
     _ = ctx;
-    return endpoint.replyTyped(contract.Status, request_id, r4os.abi.service_api_result_ok, &status);
+    return endpoint.replyTypedIfPending(contract.Status, request_id, r4os.abi.service_api_result_ok, &status);
 }
 
 fn replySnapshotSubmit(
@@ -263,12 +263,12 @@ fn replySnapshotSubmit(
     body: []const u8,
 ) i32 {
     const request = decodeStruct(contract.SnapshotRequest, body) orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (!request.header.valid(@sizeOf(contract.SnapshotRequest)) or request.search_job_id == 0)
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     const operation = contract.operationFromWire(operation_raw) orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_bad_op, "");
-    if (!tryAcquireResultsLock()) return endpoint.reply(request_id, r4os.abi.service_api_result_busy, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_bad_op, "");
+    if (!tryAcquireResultsLock()) return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_busy, "");
     defer releaseResultsLock();
     if (runtime.results.job_id != request.search_job_id)
         return replySnapshotFailure(endpoint, request_id, operation_raw, contract.result_selection_stale);
@@ -280,15 +280,15 @@ fn replySnapshotSubmit(
     const submitted = runtime.coordinator.submitSnapshot(operation, request);
     var ack = switch (submitted) {
         .accepted => |value| value,
-        .busy => |value| return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
-        .invalid => |value| return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
+        .busy => |value| return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
+        .invalid => |value| return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
     };
     runtime.stop = .{};
     const queued = snapshotBlocking(ctx) orelse {
         _ = markDurableBlocking(ctx, ack.job_id, false);
         ack.result = contract.result_persist_failed;
         ack.state = @intFromEnum(contract.State.failed);
-        return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
+        return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
     };
     const persisted = persistStatus(ctx, queued);
     if (!markDurableBlocking(ctx, ack.job_id, persisted)) {
@@ -298,7 +298,7 @@ fn replySnapshotSubmit(
         ack.generation = durable.generation;
         ack.state = durable.state;
     }
-    return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
+    return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
 }
 
 fn replySnapshotFailure(endpoint: *r4os.ServiceEndpoint, request_id: u32, operation: u16, result: i32) i32 {
@@ -307,7 +307,7 @@ fn replySnapshotFailure(endpoint: *r4os.ServiceEndpoint, request_id: u32, operat
         .state = @intFromEnum(contract.State.failed),
         .result = result,
     };
-    return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
+    return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
 }
 
 fn replySubmit(
@@ -318,12 +318,12 @@ fn replySubmit(
     body: []const u8,
 ) i32 {
     const request = decodeStruct(contract.CommandRequest, body) orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     const submitted = runtime.coordinator.submit(operation, request);
     var ack = switch (submitted) {
         .accepted => |value| value,
-        .busy => |value| return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
-        .invalid => |value| return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
+        .busy => |value| return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
+        .invalid => |value| return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
     };
 
     runtime.stop = .{};
@@ -331,7 +331,7 @@ fn replySubmit(
         _ = markDurableBlocking(ctx, ack.job_id, false);
         ack.result = contract.result_persist_failed;
         ack.state = @intFromEnum(contract.State.failed);
-        return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
+        return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
     };
     const persisted = persistStatus(ctx, queued);
     if (!markDurableBlocking(ctx, ack.job_id, persisted)) {
@@ -341,7 +341,7 @@ fn replySubmit(
         ack.generation = durable.generation;
         ack.state = durable.state;
     }
-    return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
+    return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
 }
 
 fn replyDownloadSubmit(
@@ -351,11 +351,11 @@ fn replyDownloadSubmit(
     body: []const u8,
 ) i32 {
     const request = decodeStruct(contract.DownloadRequest, body) orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (!request.header.valid(@sizeOf(contract.DownloadRequest)) or request.search_job_id == 0)
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (!tryAcquireResultsLock())
-        return endpoint.reply(request_id, r4os.abi.service_api_result_busy, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_busy, "");
     defer releaseResultsLock();
 
     if (runtime.results.job_id != request.search_job_id or request.result_index >= runtime.results.plan.package_count) {
@@ -364,12 +364,12 @@ fn replyDownloadSubmit(
             .state = @intFromEnum(contract.State.failed),
             .result = contract.result_selection_stale,
         };
-        return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &stale);
+        return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &stale);
     }
 
     var offer = contract.Offer{};
     if (!fillOffer(&offer, request.result_index))
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (offer.state == @intFromEnum(contract.State.downloaded)) {
         const ready = contract.Ack{
             .job_id = if (runtime.download.valid) runtime.download.record.job_id else 0,
@@ -377,14 +377,14 @@ fn replyDownloadSubmit(
             .state = @intFromEnum(contract.State.downloaded),
             .result = contract.result_ok,
         };
-        return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ready);
+        return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ready);
     }
 
     const submitted = runtime.coordinator.submitDownload(request);
     var ack = switch (submitted) {
         .accepted => |value| value,
-        .busy => |value| return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
-        .invalid => |value| return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
+        .busy => |value| return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
+        .invalid => |value| return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &value),
     };
     const candidate = update_download.Record.init(
         ack.job_id,
@@ -401,7 +401,7 @@ fn replyDownloadSubmit(
         _ = markDurableBlocking(ctx, ack.job_id, false);
         ack.state = @intFromEnum(contract.State.failed);
         ack.result = contract.result_invalid;
-        return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
+        return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
     };
 
     if (runtime.download.valid and !runtime.download.record.sameOffer(&candidate))
@@ -427,7 +427,7 @@ fn replyDownloadSubmit(
         ack.generation = durable.generation;
         ack.state = durable.state;
     }
-    return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
+    return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
 }
 
 fn replyCancel(
@@ -437,9 +437,9 @@ fn replyCancel(
     body: []const u8,
 ) i32 {
     const request = decodeStruct(contract.CancelRequest, body) orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (!request.header.valid(@sizeOf(contract.CancelRequest)))
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     const result = runtime.coordinator.cancel(request.job_id);
     var ack = switch (result) {
         .accepted => |value| value,
@@ -452,21 +452,21 @@ fn replyCancel(
             if (!persistStatus(ctx, status)) ack.result = contract.result_persist_failed;
         }
     }
-    return endpoint.replyTyped(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
+    return endpoint.replyTypedIfPending(contract.Ack, request_id, r4os.abi.service_api_result_ok, &ack);
 }
 
 fn replyResults(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint, request_id: u32, body: []const u8) i32 {
     const request = decodeStruct(contract.ResultsRequest, body) orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (!request.header.valid(@sizeOf(contract.ResultsRequest)))
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (!tryAcquireResultsLock())
-        return endpoint.reply(request_id, r4os.abi.service_api_result_busy, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_busy, "");
     defer releaseResultsLock();
     if (runtime.results.job_id == 0)
-        return endpoint.reply(request_id, r4os.abi.service_api_result_not_found, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_not_found, "");
     if (request.job_id != 0 and request.job_id != runtime.results.job_id)
-        return endpoint.reply(request_id, r4os.abi.service_api_result_not_found, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_not_found, "");
 
     var page = contract.ResultsPage{
         .job_id = runtime.results.job_id,
@@ -487,25 +487,25 @@ fn replyResults(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint,
         }
     }
     _ = ctx;
-    return endpoint.replyTyped(contract.ResultsPage, request_id, r4os.abi.service_api_result_ok, &page);
+    return endpoint.replyTypedIfPending(contract.ResultsPage, request_id, r4os.abi.service_api_result_ok, &page);
 }
 
 fn replyComponents(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint, request_id: u32, body: []const u8) i32 {
     const request = decodeStruct(contract.ComponentRequest, body) orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (!request.header.valid(@sizeOf(contract.ComponentRequest)))
-        return endpoint.reply(request_id, r4os.abi.service_api_result_invalid, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_invalid, "");
     if (!tryAcquireResultsLock())
-        return endpoint.reply(request_id, r4os.abi.service_api_result_busy, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_busy, "");
     defer releaseResultsLock();
     if (runtime.results.job_id == 0 or request.job_id != runtime.results.job_id or
         request.result_index >= runtime.results.plan.package_count)
-        return endpoint.reply(request_id, r4os.abi.service_api_result_not_found, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_not_found, "");
 
     const package_index = runtime.results.plan.packageIndex(request.result_index) orelse
-        return endpoint.reply(request_id, r4os.abi.service_api_result_not_found, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_not_found, "");
     if (package_index >= runtime.results.release.package_count)
-        return endpoint.reply(request_id, r4os.abi.service_api_result_not_found, "");
+        return endpoint.replyIfPending(request_id, r4os.abi.service_api_result_not_found, "");
     const package = &runtime.results.release.packages[package_index];
     var page = contract.ComponentPage{
         .job_id = runtime.results.job_id,
@@ -521,26 +521,26 @@ fn replyComponents(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoi
         }
     }
     _ = ctx;
-    return endpoint.replyTyped(contract.ComponentPage, request_id, r4os.abi.service_api_result_ok, &page);
+    return endpoint.replyTypedIfPending(contract.ComponentPage, request_id, r4os.abi.service_api_result_ok, &page);
 }
 
 fn replyBatchedResults(endpoint: *r4os.ServiceEndpoint, request_id: u32, op: u16, body: []const u8) i32 {
     const request = decodeStruct(contract.PageRequest, body) orelse
-        return endpoint.reply(request_id, contract.result_invalid, "");
+        return endpoint.replyIfPending(request_id, contract.result_invalid, "");
     if (!request.header.valid(@sizeOf(contract.PageRequest)) or request.job_id == 0 or
         (request.generation == 0 and (op != contract.op_results_bundle or request.result_index != 0)))
-        return endpoint.reply(request_id, contract.result_invalid, "");
-    if (!tryAcquireResultsLock()) return endpoint.reply(request_id, contract.result_busy, "");
+        return endpoint.replyIfPending(request_id, contract.result_invalid, "");
+    if (!tryAcquireResultsLock()) return endpoint.replyIfPending(request_id, contract.result_busy, "");
     var locked = true;
     defer if (locked) releaseResultsLock();
     if (runtime.results.job_id != request.job_id or
         (request.generation != 0 and request.generation != runtime.results_generation))
-        return endpoint.reply(request_id, contract.result_selection_stale, "");
+        return endpoint.replyIfPending(request_id, contract.result_selection_stale, "");
     const generation = runtime.results_generation;
     const total = runtime.results.plan.package_count;
     if (op == contract.op_results_bundle) {
         if (request.component_index != 0 or request.result_index > total)
-            return endpoint.reply(request_id, contract.result_invalid, "");
+            return endpoint.replyIfPending(request_id, contract.result_invalid, "");
         var bundle = contract.ResultsBundle{ .page = .{
             .job_id = request.job_id,
             .generation = generation,
@@ -553,26 +553,26 @@ fn replyBatchedResults(endpoint: *r4os.ServiceEndpoint, request_id: u32, op: u16
         page.current_release_len = @intCast(copyFixed(&page.current_release, runtime.results.current_release[0..runtime.results.current_release_len]));
         if (request.result_index < total) {
             if (!fillOffer(&page.offer, request.result_index))
-                return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+                return endpoint.replyIfPending(request_id, contract.result_catalog_invalid, "");
             page.has_offer = 1;
             if (page.offer.component_count != 0) {
                 const index = runtime.results.plan.packageIndex(request.result_index) orelse
-                    return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+                    return endpoint.replyIfPending(request_id, contract.result_catalog_invalid, "");
                 if (!fillComponent(&bundle.first_component, &runtime.results.release.packages[index], 0))
-                    return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+                    return endpoint.replyIfPending(request_id, contract.result_catalog_invalid, "");
             }
         }
         releaseResultsLock();
         locked = false;
-        return endpoint.replyTyped(contract.ResultsBundle, request_id, contract.result_ok, &bundle);
+        return endpoint.replyTypedIfPending(contract.ResultsBundle, request_id, contract.result_ok, &bundle);
     }
     const index = runtime.results.plan.packageIndex(request.result_index) orelse
-        return endpoint.reply(request_id, contract.result_not_found, "");
+        return endpoint.replyIfPending(request_id, contract.result_not_found, "");
     if (index >= runtime.results.release.package_count)
-        return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+        return endpoint.replyIfPending(request_id, contract.result_catalog_invalid, "");
     const package = &runtime.results.release.packages[index];
     if (request.component_index >= package.component_count)
-        return endpoint.reply(request_id, contract.result_invalid, "");
+        return endpoint.replyIfPending(request_id, contract.result_invalid, "");
     var batch = contract.ComponentBatch{
         .job_id = request.job_id,
         .generation = generation,
@@ -583,11 +583,11 @@ fn replyBatchedResults(endpoint: *r4os.ServiceEndpoint, request_id: u32, op: u16
     };
     for (batch.components[0..batch.count], 0..) |*component, i| {
         if (!fillComponent(component, package, request.component_index + i))
-            return endpoint.reply(request_id, contract.result_catalog_invalid, "");
+            return endpoint.replyIfPending(request_id, contract.result_catalog_invalid, "");
     }
     releaseResultsLock();
     locked = false;
-    return endpoint.replyTyped(contract.ComponentBatch, request_id, contract.result_ok, &batch);
+    return endpoint.replyTypedIfPending(contract.ComponentBatch, request_id, contract.result_ok, &batch);
 }
 
 fn resultsChanged() void {
