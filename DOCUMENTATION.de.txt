@@ -46,3 +46,27 @@ Zustand stehenbleibt, waehrend der Gesamtstatus bereits `staged` meldet.
 Die nicht einkompilierte Verbindungskonfiguration liegt unter
 `C:\R4OS\CONFIG\UPDATE.R4S`. UPDSVC gehoert zum Slim-Profil und wird ueber
 `SERVICES.R4S` automatisch gestartet.
+
+
+Abschluss und vorbereiteter Neustart ab 0.78.72
+--------------------------------------------
+Der Worker behaelt den fertigen Abschluss einschliesslich eigenem
+Begruendungstext bis zur Veroeffentlichung. Pro Schleifendurchlauf erfolgt
+ein begrenzter Sperrversuch; bei Kollision folgt ein Tick Pause. Die Arbeit
+wird nicht erneut ausgefuehrt. Eine unpassende Jobidentitaet wird explizit
+gemeldet. Auch beim Stop wird ein wartender Abschluss noch veroeffentlicht.
+Ergebnis, aktive Arbeit und Folgeannahme werden gemeinsam gesperrt geaendert.
+
+Ein vollstaendig vorbereiteter Neustartbatch reserviert seinen Suchstand.
+Weitere Auftraege, insbesondere neue Suchen, werden vor Aenderung von Job,
+Status oder Ergebnisliste zurueckgewiesen. Der passende Neustart bleibt
+moeglich. UpdateCenter deaktiviert die Suche und sendet ausschliesslich
+die bestaetigte, zur angezeigten Liste passende Neustartidentitaet. Nach
+einem zurueckgekehrten Commitfehler kann derselbe Batch erneut versucht
+werden; ein neu geoeffnetes Fenster laedt den zugehoerigen Suchstand nach.
+Keine Aenderung des Drahtvertrags oder der Paket-/Downloadlogik.
+
+Drei kurze Hostfaelle pruefen einen gezielten Abschlusskonflikt, kopierte
+Abschlusstexte und Folgearbeit, die Oberflaechenbindung sowie die gemeinsame
+Vorbereiten/Suchversuch/Neustart/Wiederholungsfolge. Keine echte Installation.
+Die beiden Besitzerartefakte sind UPDSVC0.2.20 und UpdateCenter0.2.5.

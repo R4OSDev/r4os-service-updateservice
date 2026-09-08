@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.2.15`
+- Version: `0.2.20`
 - Image target: `/R4OS/SERVICES/UPDSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -44,3 +44,24 @@ Detailed German technical notes from the migration are preserved in
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+
+Completion and prepared restart ownership (0.78.72)
+--------------------------------------------------
+The worker retains a completed result, including owned reason bytes, until
+the coordinator publishes it. One lock attempt runs per worker cycle;
+contention yields one tick and retries without executing the work again.
+A stale job is reported explicitly. Shutdown also drains a pending result.
+Result fields, active ownership and admission of the next job change under
+the same coordinator lock.
+
+A fully prepared restart batch reserves its search snapshot. Other work,
+including another search, is rejected before any job or result identity is
+changed; the matching restart remains admissible. UpdateCenter disables a
+new search and binds the restart request to the confirmed search ID and
+the displayed results. A returned commit failure retains that identity for
+retry, including after reopening the window. The wire contract is unchanged.
+
+Three short host cases cover one forced completion collision, owned reason
+bytes, subsequent work, UI identity checks and the combined prepare/search/
+restart/retry transition. No installation is executed by these fixtures.

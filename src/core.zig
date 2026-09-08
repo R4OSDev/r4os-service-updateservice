@@ -29,6 +29,55 @@ pub const Completion = struct {
     package_count: u32 = 0,
     completed_count: u32 = 0,
     reason: []const u8 = "",
+    owned_reason: [contract.reason_capacity]u8 = .{0} ** contract.reason_capacity,
+    owned_reason_len: ?u16 = null,
+    prepared_search_job_id: u32 = 0,
+
+    pub fn setReason(self: *Completion, text: []const u8) void {
+        const length = @min(text.len, self.owned_reason.len);
+        std.mem.copyForwards(u8, self.owned_reason[0..length], text[0..length]);
+        self.owned_reason_len = @intCast(length);
+        self.reason = "";
+    }
+
+    pub fn withReason(self: Completion, text: []const u8) Completion {
+        var result = self;
+        result.setReason(text);
+        return result;
+    }
+
+    pub fn reasonText(self: *const Completion) []const u8 {
+        if (self.owned_reason_len) |length| return self.owned_reason[0..length];
+        return self.reason;
+    }
+};
+
+pub const CompleteResult = enum { busy, stale, published };
+
+/// Worker-owned result. Each step attempts one bounded lock acquisition;
+/// contention retains the result without repeating the completed work.
+pub const CompletionPublisher = struct {
+    pending: ?struct { job_id: u32, completion: Completion } = null,
+
+    pub fn retain(self: *CompletionPublisher, job_id: u32, completion: Completion) void {
+        std.debug.assert(self.pending == null);
+        self.pending = .{ .job_id = job_id, .completion = completion.withReason(completion.reasonText()) };
+    }
+
+    pub fn step(self: *CompletionPublisher, coordinator: *Coordinator) enum { idle, retry, published, stale } {
+        const pending = self.pending orelse return .idle;
+        switch (coordinator.tryComplete(pending.job_id, pending.completion)) {
+            .busy => return .retry,
+            .stale => {
+                self.pending = null;
+                return .stale;
+            },
+            .published => {
+                self.pending = null;
+                return .published;
+            },
+        }
+    }
 };
 
 pub const Coordinator = struct {
@@ -38,6 +87,7 @@ pub const Coordinator = struct {
     durable: bool = false,
     active: bool = false,
     next_job_id: u32 = 0,
+    prepared_search_job_id: u32 = 0,
     work: Work = .{ .job_id = 0, .operation = .search, .request = .{} },
     cancel_requested: u32 = 0,
 
@@ -85,6 +135,12 @@ pub const Coordinator = struct {
 
         if (self.queued or self.active or (self.status.flags & contract.flag_busy) != 0)
             return .{ .busy = self.busyAckLocked(operation_raw) };
+
+        // A completely prepared batch owns its result snapshot until restart.
+        // Reject other work before changing job/status identity or queue state.
+        if (self.prepared_search_job_id != 0 and
+            (operation != .restart or source_job_id != self.prepared_search_job_id))
+            return .{ .invalid = makeAck(0, operation_raw, .pending_restart, contract.result_not_ready, self.status.generation) };
 
         self.next_job_id +%= 1;
         if (self.next_job_id == 0) self.next_job_id = 1;
@@ -141,9 +197,13 @@ pub const Coordinator = struct {
     }
 
     pub fn complete(self: *Coordinator, job_id: u32, completion: Completion) bool {
-        if (!self.tryAcquire()) return false;
+        return self.tryComplete(job_id, completion) == .published;
+    }
+
+    pub fn tryComplete(self: *Coordinator, job_id: u32, completion: Completion) CompleteResult {
+        if (!self.tryAcquire()) return .busy;
         defer self.release();
-        if (!self.active or self.work.job_id != job_id) return false;
+        if (!self.active or self.work.job_id != job_id) return .stale;
         self.active = false;
         self.status.state = @intFromEnum(completion.state);
         self.status.result = completion.result;
@@ -153,9 +213,15 @@ pub const Coordinator = struct {
         self.status.package_count = completion.package_count;
         self.status.completed_count = completion.completed_count;
         self.status.generation +%= 1;
-        contract.setReason(&self.status, completion.reason);
+        contract.setReason(&self.status, completion.reasonText());
+        if (completion.prepared_search_job_id != 0 and completion.state == .pending_restart and completion.result == contract.result_ok)
+            self.prepared_search_job_id = completion.prepared_search_job_id;
+        if (self.prepared_search_job_id != 0) {
+            self.status.source_job_id = self.prepared_search_job_id;
+            self.status.flags |= contract.flag_restart_required;
+        }
         @atomicStore(u32, &self.cancel_requested, 0, .release);
-        return true;
+        return .published;
     }
 
     pub fn transition(self: *Coordinator, job_id: u32, state: contract.State, reason: []const u8) bool {
@@ -233,6 +299,7 @@ pub const Coordinator = struct {
         defer self.release();
         self.status = saved;
         self.next_job_id = saved.job_id;
+        self.prepared_search_job_id = 0;
         self.queued = false;
         self.durable = false;
         self.active = false;
@@ -389,6 +456,41 @@ test "one durable job owns all clients and a second submit is busy" {
     const status = coordinator.snapshot() orelse return error.MissingStatus;
     try std.testing.expectEqual(@intFromEnum(contract.State.installed), status.state);
     try std.testing.expectEqualStrings("done", status.reasonText());
+}
+
+test "completion publisher retains one contended result before accepting new work" {
+    var coordinator = Coordinator.init(true);
+    const job = coordinator.submit(contract.op_search, .{}).accepted.job_id;
+    try std.testing.expect(coordinator.markDurable(job, true));
+    _ = coordinator.takeWork().?;
+    var reason = "finished".*;
+    const completion = (Completion{
+        .state = .available,
+        .result = contract.result_ok,
+        .flags = contract.flag_results_ready,
+        .package_count = 2,
+        .completed_count = 2,
+    }).withReason(&reason);
+    @memset(&reason, 'x');
+    var publisher = CompletionPublisher{};
+    publisher.retain(job, completion);
+    @atomicStore(u32, &coordinator.lock, 1, .release);
+    try std.testing.expect(publisher.step(&coordinator) == .retry);
+    try std.testing.expect(publisher.pending != null and coordinator.active);
+    @atomicStore(u32, &coordinator.lock, 0, .release);
+    try std.testing.expect(coordinator.submit(contract.op_search, .{}) == .busy);
+    try std.testing.expect(publisher.step(&coordinator) == .published);
+    const status = coordinator.snapshot().?;
+    try std.testing.expect(!coordinator.active and publisher.pending == null);
+    try std.testing.expectEqual(@as(u32, 0), status.flags & contract.flag_busy);
+    try std.testing.expectEqual(@as(u32, 2), status.completed_count);
+    try std.testing.expectEqual(@intFromEnum(contract.State.available), status.state);
+    try std.testing.expectEqualStrings("finished", status.reasonText());
+    const next = coordinator.submit(contract.op_search, .{}).accepted.job_id;
+    try std.testing.expect(next != job);
+    publisher.retain(job, completion);
+    try std.testing.expect(publisher.step(&coordinator) == .stale);
+    try std.testing.expectEqual(next, coordinator.snapshot().?.job_id);
 }
 
 test "parallel callers produce exactly one accepted job" {

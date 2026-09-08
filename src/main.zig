@@ -599,12 +599,28 @@ fn workerMain(arg: u64) callconv(.c) i32 {
     const state: *Runtime = @ptrFromInt(arg);
     const app = state.app orelse return 1;
     const ctx = app.system();
-    while (@atomicLoad(u32, &state.shutdown, .acquire) == 0) {
+    var publisher = core.CompletionPublisher{};
+    while (publisher.pending != null or @atomicLoad(u32, &state.shutdown, .acquire) == 0) {
+        switch (publisher.step(&state.coordinator)) {
+            .retry => {
+                ctx.sleepTicks(1);
+                continue;
+            },
+            .published => {
+                if (state.coordinator.snapshot()) |status| _ = persistStatus(&ctx, status);
+                continue;
+            },
+            .stale => {
+                ctx.println("UPDSVC completion rejected: active job identity changed");
+                return 1;
+            },
+            .idle => {},
+        }
         if (state.coordinator.takeWork()) |work| {
             if (state.coordinator.snapshot()) |status| _ = persistStatus(&ctx, status);
-            const completion = executeWork(app, state, work);
-            _ = state.coordinator.complete(work.job_id, completion);
-            if (state.coordinator.snapshot()) |status| _ = persistStatus(&ctx, status);
+            var completion = executeWork(app, state, work);
+            if (state.prepared_restart) completion.prepared_search_job_id = state.prepared_search_job_id;
+            publisher.retain(work.job_id, completion);
         } else {
             ctx.sleepTicks(1);
         }
@@ -853,7 +869,10 @@ fn searchCompletion(plan: *const update_catalog.Plan) core.Completion {
 }
 
 fn searchFailure(result: i32, reason: []const u8) core.Completion {
-    return .{ .state = .failed, .result = result, .reason = reason };
+    return (core.Completion{
+        .state = .failed,
+        .result = result,
+    }).withReason(reason);
 }
 
 const DownloadPaths = struct {
@@ -1090,14 +1109,13 @@ fn downloadFailure(
         _ = persistDownloadRecord(ctx, &state.download.record);
         updateOfferState(ctx, &state.download.record, .failed, result, state.download.record.progress);
     }
-    return .{
+    return (core.Completion{
         .state = if (result == contract.result_cancelled) .cancelled else .failed,
         .result = result,
         .progress_current = if (state.download.valid) state.download.record.progress else 0,
         .progress_total = if (state.download.valid) state.download.record.expected_size else 0,
         .package_count = if (state.download.valid) 1 else 0,
-        .reason = reason,
-    };
+    }).withReason(reason);
 }
 
 fn buildDownloadPaths(record: *const update_download.Record) ?DownloadPaths {
@@ -1370,7 +1388,7 @@ fn executeInstall(app: *r4os.App, state: *Runtime, work: *const core.Work) core.
         state.prepared_search_job_id = binding.search_job_id;
         completion.state = .pending_restart;
         completion.flags |= contract.flag_restart_required | contract.flag_results_ready;
-        completion.reason = "restart-ready";
+        completion.setReason("restart-ready");
         setOfferContractState(
             &ctx,
             binding.search_job_id,
@@ -1385,7 +1403,7 @@ fn executeInstall(app: *r4os.App, state: *Runtime, work: *const core.Work) core.
 
     const confirmed = engine.confirmLiveRelease(binding.sourceText(), binding.targetText());
     if (confirmed.exit_code != 0) return completionFromEngine(&confirmed);
-    completion.reason = "release-installed";
+    completion.setReason("release-installed");
     return completion;
 }
 
@@ -1552,13 +1570,12 @@ fn executeRestart(app: *r4os.App, state: *Runtime, work: *const core.Work) core.
 }
 
 fn updateAllFailure(package_count: u32, completed_count: u32, result: i32, reason: []const u8) core.Completion {
-    return .{
+    return (core.Completion{
         .state = if (result == contract.result_cancelled) .cancelled else .failed,
         .result = result,
         .package_count = package_count,
         .completed_count = completed_count,
-        .reason = if (reason.len != 0) reason else "update-all-failed",
-    };
+    }).withReason(if (reason.len != 0) reason else "update-all-failed");
 }
 
 fn downloadRecordForResult(job_id: u32, search_job_id: u32, result_index: usize) ?update_download.Record {
@@ -1638,14 +1655,13 @@ fn snapshotPreparedForRestart(
 
 fn completionFromEngine(result: *const update_engine.Result) core.Completion {
     if (result.exit_code != 0) {
-        return .{
+        return (core.Completion{
             .state = if (result.state == .busy) .failed else .failed,
             .result = result.exit_code,
             .flags = if (result.restart_required) contract.flag_restart_required else 0,
             .package_count = result.batch_package_count,
             .completed_count = result.committed_count,
-            .reason = result.reasonText(),
-        };
+        }).withReason(result.reasonText());
     }
     const target_state: contract.State = switch (result.state) {
         .installed => .installed,
@@ -1653,14 +1669,13 @@ fn completionFromEngine(result: *const update_engine.Result) core.Completion {
         .pending_restart, .restart_required => .pending_restart,
         else => .installed,
     };
-    return .{
+    return (core.Completion{
         .state = target_state,
         .result = result.exit_code,
         .flags = if (result.restart_required or target_state == .pending_restart) contract.flag_restart_required else 0,
         .package_count = if (result.batch_package_count != 0) result.batch_package_count else 1,
         .completed_count = result.committed_count,
-        .reason = if (result.reasonText().len != 0) result.reasonText() else contract.stateName(@intFromEnum(target_state)),
-    };
+    }).withReason(if (result.reasonText().len != 0) result.reasonText() else contract.stateName(@intFromEnum(target_state)));
 }
 
 fn cancelledCompletion() core.Completion {
@@ -1668,7 +1683,10 @@ fn cancelledCompletion() core.Completion {
 }
 
 fn invalidCompletion(reason: []const u8) core.Completion {
-    return .{ .state = .failed, .result = contract.result_invalid, .reason = reason };
+    return (core.Completion{
+        .state = .failed,
+        .result = contract.result_invalid,
+    }).withReason(reason);
 }
 
 fn loadConfig(ctx: *const r4os.r4sys.Context) ServiceConfig {
