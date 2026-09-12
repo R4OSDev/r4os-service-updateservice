@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.2.20`
+- Version: `0.2.21`
 - Image target: `/R4OS/SERVICES/UPDSVC.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -34,6 +34,12 @@ Resume rehashes only the retained prefix before continuing. Result operations
 10/11 bundle each offer with its first component and up to eight subsequent
 components per page, bound to one job and result generation. Existing result
 operations remain available for older clients.
+
+Version 0.2.21 includes the same target-parent provisioning as SYSUPD 0.1.17.
+The shared engine checks existing parent types, creates missing C: ancestors
+only when staging under durable update intent, and verifies each directory.
+Rollback retains shared directories and continues to own only the journaled
+files. No separate service-side installer or journal format is introduced.
 
 Detailed German technical notes from the migration are preserved in
 `DOCUMENTATION.de.txt`. Source-transfer provenance is recorded in
