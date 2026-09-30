@@ -2,6 +2,13 @@
 ===========
 
 UPDSVC ist der einzige Hintergrunddienst fuer die R4OS-Clientupdates.
+
+Seit Modul 0.2.24 liest der Statuspfad der gemeinsamen Update-Engine bei
+einem I/O-Fehler hoechstens dreimal beide Journalgruppen mit neuer
+Dateigroesse. Konkurrierender Austausch einer kuerzeren Datei kann damit
+aufgeloest werden. Nur eine vollstaendig gelesene Sicht veroeffentlicht
+Batch- und Transaktionsmetadaten; dauerhafte Fehler bleiben erfolglos.
+Installationsbefehle und Journalformat sind unveraendert.
 Der versionierte Endpoint `UPDSVC` besitzt Status, Suche, Download,
 Installation, Update All, Abbruch und eine paginierte Ergebnissicht.
 
