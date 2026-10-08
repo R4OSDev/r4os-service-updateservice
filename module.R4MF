@@ -1,7 +1,7 @@
 R4OS_MODULE_MANIFEST=2
 KIND=R4X
 NAME=UPDSVC
-VERSION=0.2.24
+VERSION=0.2.26
 LANGUAGE=Zig
 SOURCE=src/main.zig
 ZIG_MODULE=system_update_engine:../../SDK/r4os/system_update_engine.zig
