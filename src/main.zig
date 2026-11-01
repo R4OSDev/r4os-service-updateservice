@@ -728,9 +728,8 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
                     searchFailure(contract.result_network_failed, @tagName(failure)),
             };
             if (candidate.status == 401) {
-                const warning = std.mem.trim(u8, candidate.body, " \t\r\n");
-                const registration_required = textEquals(warning, "STOP NOW!") or textEquals(warning, "LAST CHANCE!");
-                if (!registration_required) return searchFailure(contract.result_auth_failed, "catalog-unauthorized");
+                if (!registrationRequired(&devices, candidate.body))
+                    return searchFailure(contract.result_auth_failed, "catalog-unauthorized");
                 if (retried_registration) return searchFailure(contract.result_access_warning, "registration-still-required");
                 switch (authenticate(app, &state.config, true)) {
                     .ok => {},
@@ -1922,6 +1921,16 @@ fn textEquals(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| if (left != right) return false;
     return true;
+}
+
+fn registrationRequired(dev: *const r4os.r4dev.Context, body: []const u8) bool {
+    // The server returns a JSON error code; the human-readable detail may vary.
+    var depth: [4]u8 = undefined;
+    var document = r4os.json.Document.init(dev, body, &depth);
+    document.select("error") catch return false;
+    var code: [32]u8 = undefined;
+    const value = document.value(&code) catch return false;
+    return textEquals(value, "registration_required");
 }
 
 fn hasArg(args: []const u8, wanted: []const u8) bool {

@@ -1,6 +1,6 @@
 .{
     .name = .r4os_updsvc,
-    .version = "0.2.31",
+    .version = "0.2.32",
     .fingerprint = 0x35591db65d062b63,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

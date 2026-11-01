@@ -12,10 +12,13 @@ Schalter, Kanal und Zeitlimits; ein alter Magic Key und ein zweites Serverziel
 werden nicht mehr gelesen. Fehlende lokale Geheimkonfiguration ergibt
 `registration-credentials-missing`. Ein eindeutiges 401 der Katalogroute
 fuehrt zu hoechstens einem koordinierten Anmelde- und GET-Versuch; 403 und
-429 werden getrennt gemeldet. Der Gastnachweis gegen den aktuellen
-oeffentlichen Katalog endete mit `up-to-date`, weil der lokale Release-Stand
-hoeher als die verfuegbaren Angebote war. Ein Paketdownload oder Apply ist
-damit noch nicht nachgewiesen.
+429 werden getrennt gemeldet. Seit 0.2.32 wird dafuer der JSON-Fehlercode
+`registration_required` geprueft. `unauthorized` loest keinen erneuten
+Registrierungsversuch aus. Ein isolierter Gasttest mit aufgeteiltem `OK`
+belegte genau einen erneuten Versuch und die getrennte 401-Behandlung.
+Der aktuelle oeffentliche Katalog enthielt beim Gastnachweis keine
+freigegebenen Releases und die Suche endete mit `up-to-date`. Ein
+Paketdownload oder Apply ist damit noch nicht nachgewiesen.
 
 Seit Modul 0.2.24 liest der Statuspfad der gemeinsamen Update-Engine bei
 einem I/O-Fehler hoechstens dreimal beide Journalgruppen mit neuer
