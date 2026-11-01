@@ -104,6 +104,10 @@ fn runService(app: *r4os.App) i32 {
     _ = ctx.dirCreate(staged_root);
     _ = ctx.dirCreate(inbox_root);
     finishPostBootBatch(app);
+    _ = r4os.server_targets.ensureDefaults(&ctx) catch |err| {
+        ctx.write("UPDSVC server registry defaults failed: ");
+        ctx.println(@errorName(err));
+    };
     const loaded_config = loadConfig(&ctx);
     runtime.app = app;
     runtime.coordinator = core.Coordinator.init(loaded_config.valid);
