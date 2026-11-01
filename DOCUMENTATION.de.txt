@@ -3,6 +3,20 @@
 
 UPDSVC ist der einzige Hintergrunddienst fuer die R4OS-Clientupdates.
 
+Seit 0.2.31 stammt das Update-Ziel ausschliesslich aus
+SYSTEM\Network\R4OSServer\Updates. Der Dienst liest es vor Suche und
+Download erneut, registriert ueber R4SRV und ruft den Schema-2-Katalog
+ueber HTTPS `/catalog.json` ab. Das explizite Transportprofil und der CA-Root
+werden von der gemeinsamen SDK-Schicht geprueft. UPDATE.R4S enthaelt nur
+Schalter, Kanal und Zeitlimits; ein alter Magic Key und ein zweites Serverziel
+werden nicht mehr gelesen. Fehlende lokale Geheimkonfiguration ergibt
+`registration-credentials-missing`. Ein eindeutiges 401 der Katalogroute
+fuehrt zu hoechstens einem koordinierten Anmelde- und GET-Versuch; 403 und
+429 werden getrennt gemeldet. Der Gastnachweis gegen den aktuellen
+oeffentlichen Katalog endete mit `up-to-date`, weil der lokale Release-Stand
+hoeher als die verfuegbaren Angebote war. Ein Paketdownload oder Apply ist
+damit noch nicht nachgewiesen.
+
 Seit Modul 0.2.24 liest der Statuspfad der gemeinsamen Update-Engine bei
 einem I/O-Fehler hoechstens dreimal beide Journalgruppen mit neuer
 Dateigroesse. Konkurrierender Austausch einer kuerzeren Datei kann damit

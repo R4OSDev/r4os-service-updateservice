@@ -24,17 +24,12 @@ const download_checkpoint_bytes: u64 = 256 * 1024;
 const ServiceConfig = struct {
     valid: bool = false,
     enabled: bool = true,
-    server: [64]u8 = .{0} ** 64,
-    server_len: usize = 0,
-    auth_port: u16 = 0,
-    update_port: u16 = 0,
+    target_ip: [4]u8 = .{0} ** 4,
+    port: u16 = 0,
     catalog_url: [update_catalog.max_download_url_bytes]u8 = .{0} ** update_catalog.max_download_url_bytes,
     catalog_url_len: usize = 0,
-    magic_key: [34]u8 = .{0} ** 34,
-    magic_key_len: usize = 0,
     channel: [32]u8 = .{0} ** 32,
     channel_len: usize = 0,
-    connect_timeout_ms: u32 = 5000,
     request_timeout_ms: u32 = 30000,
     allow_redirects: bool = false,
 };
@@ -84,6 +79,7 @@ const Runtime = struct {
     download: DownloadRuntime = .{},
     prepared_restart: bool = false,
     prepared_search_job_id: u32 = 0,
+    registered_generation: u32 = 0,
 };
 
 var runtime: Runtime = .{};
@@ -115,6 +111,7 @@ fn runService(app: *r4os.App) i32 {
     runtime.stop = .{};
     runtime.shutdown = 0;
     runtime.persist_lock = 0;
+    runtime.registered_generation = 0;
     runtime.results_lock = 0;
     runtime.results.job_id = 0;
     runtime.download.valid = loadDownloadRecord(&ctx, &runtime.download.record);
@@ -645,6 +642,7 @@ fn executeWork(app: *r4os.App, state: *Runtime, work: core.Work) core.Completion
 
 fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.Completion {
     const ctx = app.system();
+    state.config = loadConfig(&ctx);
     if (!state.config.valid) return searchFailure(contract.result_invalid, "config-invalid");
     if (!tryAcquireResultsLock()) return searchFailure(contract.result_busy, "results-busy");
     var results_locked = true;
@@ -664,12 +662,14 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
     @memset(state.results.offer_progress[0..], 0);
 
     if (state.coordinator.cancelRequested() or state.stop.requested()) return cancelledCompletion();
-    switch (authenticate(app, &state.config)) {
+    switch (authenticate(app, &state.config, false)) {
         .ok => {},
         .cancelled => return cancelledCompletion(),
-        .no_response => return searchFailure(contract.result_auth_failed, "auth-no-response"),
-        .bad_response => return searchFailure(contract.result_auth_failed, "auth-invalid-response"),
-        .network_failure => return searchFailure(contract.result_network_failed, "auth-network-failed"),
+        .credentials_missing => return searchFailure(contract.result_auth_failed, "registration-credentials-missing"),
+        .invalid_target => return searchFailure(contract.result_invalid, "server-target-invalid"),
+        .bad_response => return searchFailure(contract.result_auth_failed, "registration-invalid-response"),
+        .service_unavailable => return searchFailure(contract.result_not_ready, "server-access-unavailable"),
+        .network_failure => return searchFailure(contract.result_network_failed, "registration-network-failed"),
     }
     if (state.coordinator.cancelRequested() or state.stop.requested()) return cancelledCompletion();
     if (state.coordinator.transition(work.job_id, .searching, "catalog")) {
@@ -702,34 +702,53 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
     state.results.active_kernel_len = copyFixed(state.results.active_kernel[0..], active_kernel);
 
     var web = app.web() orelse return searchFailure(contract.result_network_failed, "web-unavailable");
-    const fetch = web.fetch(
-        state.config.catalog_url[0..state.config.catalog_url_len],
-        state.results.raw_response[0..],
-        state.results.catalog_bytes[0..],
-        state.results.tls_scratch[0..],
-        .{
-            .timeout = timeoutFromMs(state.config.request_timeout_ms),
-            .redirect = if (state.config.allow_redirects) .follow else .error_mode,
-            .redirect_limit = if (state.config.allow_redirects) 3 else 0,
-            .stop = &state.stop.storage,
-            .headers = "accept:application/json\n",
-        },
-    );
-    const response = switch (fetch) {
-        .response => |value| value,
-        .failure => |failure| return if (failure == .cancelled)
-            cancelledCompletion()
-        else if (failure == .response_too_large or failure == .header_buffer_too_small or failure == .io_buffer_too_small)
-            searchFailure(contract.result_response_too_large, "catalog-too-large")
-        else
-            searchFailure(contract.result_network_failed, @tagName(failure)),
+    const response = read_catalog: {
+        var retried_registration = false;
+        while (true) {
+            const fetch = web.fetch(
+                state.config.catalog_url[0..state.config.catalog_url_len],
+                state.results.raw_response[0..],
+                state.results.catalog_bytes[0..],
+                state.results.tls_scratch[0..],
+                .{
+                    .timeout = timeoutFromMs(state.config.request_timeout_ms),
+                    .redirect = if (state.config.allow_redirects) .follow else .error_mode,
+                    .redirect_limit = if (state.config.allow_redirects) 3 else 0,
+                    .stop = &state.stop.storage,
+                    .headers = "accept:application/json\n",
+                },
+            );
+            const candidate = switch (fetch) {
+                .response => |value| value,
+                .failure => |failure| return if (failure == .cancelled)
+                    cancelledCompletion()
+                else if (failure == .response_too_large or failure == .header_buffer_too_small or failure == .io_buffer_too_small)
+                    searchFailure(contract.result_response_too_large, "catalog-too-large")
+                else
+                    searchFailure(contract.result_network_failed, @tagName(failure)),
+            };
+            if (candidate.status == 401) {
+                const warning = std.mem.trim(u8, candidate.body, " \t\r\n");
+                const registration_required = textEquals(warning, "STOP NOW!") or textEquals(warning, "LAST CHANCE!");
+                if (!registration_required) return searchFailure(contract.result_auth_failed, "catalog-unauthorized");
+                if (retried_registration) return searchFailure(contract.result_access_warning, "registration-still-required");
+                switch (authenticate(app, &state.config, true)) {
+                    .ok => {},
+                    .cancelled => return cancelledCompletion(),
+                    .credentials_missing => return searchFailure(contract.result_auth_failed, "registration-credentials-missing"),
+                    .invalid_target => return searchFailure(contract.result_invalid, "server-target-invalid"),
+                    .bad_response => return searchFailure(contract.result_auth_failed, "registration-invalid-response"),
+                    .service_unavailable => return searchFailure(contract.result_not_ready, "server-access-unavailable"),
+                    .network_failure => return searchFailure(contract.result_network_failed, "registration-network-failed"),
+                }
+                retried_registration = true;
+                continue;
+            }
+            break :read_catalog candidate;
+        }
     };
-    if (response.status == 401) {
-        const warning = std.mem.trim(u8, response.body, " \t\r\n");
-        if (textEquals(warning, "STOP NOW!")) return searchFailure(contract.result_access_warning, "STOP NOW!");
-        if (textEquals(warning, "LAST CHANCE!")) return searchFailure(contract.result_access_warning, "LAST CHANCE!");
-        return searchFailure(contract.result_auth_failed, "authenticate-required");
-    }
+    if (response.status == 403) return searchFailure(contract.result_access_warning, "catalog-blocked-or-forbidden");
+    if (response.status == 429) return searchFailure(contract.result_network_failed, "catalog-rate-limited");
     if (response.status != 200) return searchFailure(contract.result_network_failed, "catalog-http-status");
     if (response.content_type) |content_type| {
         if (!startsWithIgnoreCase(content_type, "application/json"))
@@ -785,74 +804,32 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
     return searchCompletion(&state.results.plan);
 }
 
-const AuthResult = enum { ok, cancelled, no_response, bad_response, network_failure };
+const AuthResult = enum { ok, cancelled, credentials_missing, invalid_target, bad_response, service_unavailable, network_failure };
 
-fn authenticate(app: *r4os.App, config: *const ServiceConfig) AuthResult {
+fn authenticate(app: *r4os.App, config: *const ServiceConfig, force: bool) AuthResult {
     if (runtime.stop.requested()) return .cancelled;
-    const ctx = app.system();
-    const network = app.network() orelse return .network_failure;
-    const server = config.server[0..config.server_len];
-    const address = parseIpv4(server) orelse block: {
-        var resolver = network.resolver();
-        break :block switch (resolver.resolveA(server, null, timeoutFromMs(config.connect_timeout_ms))) {
-            .address => |value| value,
-            .timed_out, .not_found, .no_service, .failure => return .network_failure,
-        };
+    const services = app.services() orelse return .service_unavailable;
+    const client = r4os.server_access.Client{ .services = services };
+    const result = if (force)
+        client.retryAfterRegistrationRequired(.updates, runtime.registered_generation)
+    else
+        client.ensure(.updates);
+    const response = switch (result) {
+        .response => |value| value,
+        .unavailable, .timed_out, .malformed => return .service_unavailable,
     };
-    var socket = switch (network.connectTcp(.{ .address = address, .port = config.auth_port }, timeoutFromMs(config.connect_timeout_ms))) {
-        .socket => |value| value,
-        .timed_out, .would_block, .reset, .peer_closed, .no_service, .failure => return .network_failure,
-    };
-    defer _ = socket.close(timeoutFromMs(config.connect_timeout_ms));
-
-    const key = config.magic_key[0..config.magic_key_len];
-    var auth_line: [35]u8 = undefined;
-    if (key.len + 1 > auth_line.len) return .network_failure;
-    @memcpy(auth_line[0..key.len], key);
-    auth_line[key.len] = '\n';
-    const payload = auth_line[0 .. key.len + 1];
-    var sent: usize = 0;
-    while (sent < payload.len) {
-        if (runtime.stop.requested()) return .cancelled;
-        switch (socket.write(payload[sent..], timeoutFromMs(config.connect_timeout_ms))) {
-            .bytes => |count| {
-                if (count == 0 or count > payload.len - sent) return .network_failure;
-                sent += count;
-            },
-            else => return .network_failure,
-        }
+    if (response.code != @intFromEnum(r4os.server_access.Code.ok)) {
+        if (response.code == @intFromEnum(r4os.server_access.Code.credentials)) return .credentials_missing;
+        if (response.code == @intFromEnum(r4os.server_access.Code.target) or
+            response.code == @intFromEnum(r4os.server_access.Code.profile)) return .invalid_target;
+        if (response.code == @intFromEnum(r4os.server_access.Code.invalid_reply) or
+            response.code == @intFromEnum(r4os.server_access.Code.invalid_secret)) return .bad_response;
+        return .network_failure;
     }
-
-    var reply: [2]u8 = undefined;
-    var received: usize = 0;
-    const reply_started = ctx.timeState().monotonic_ticks;
-    while (received < reply.len) {
-        if (runtime.stop.requested()) return .cancelled;
-        switch (socket.read(reply[received..], timeoutFromMs(config.connect_timeout_ms))) {
-            .bytes => |count| {
-                if (count > reply.len - received) return .bad_response;
-                if (count == 0) {
-                    if (authReplyExpired(&ctx, reply_started, config.connect_timeout_ms)) return .no_response;
-                    ctx.sleepTicks(1);
-                    continue;
-                }
-                received += count;
-            },
-            .would_block, .timed_out => {
-                if (authReplyExpired(&ctx, reply_started, config.connect_timeout_ms)) return .no_response;
-                ctx.sleepTicks(1);
-                continue;
-            },
-            .peer_closed => return .no_response,
-            else => return .network_failure,
-        }
-    }
-    return if (textEquals(reply[0..], "OK")) .ok else .bad_response;
-}
-
-fn authReplyExpired(ctx: *const r4os.r4sys.Context, started: u64, timeout_ms: u32) bool {
-    const elapsed = ctx.timeState().monotonic_ticks -| started;
-    return elapsed >= ctx.ticksFromMilliseconds(timeout_ms);
+    if (response.port != config.port or !std.mem.eql(u8, &response.target_ip, &config.target_ip) or
+        response.generation == 0) return .invalid_target;
+    runtime.registered_generation = response.generation;
+    return .ok;
 }
 
 fn searchCompletion(plan: *const update_catalog.Plan) core.Completion {
@@ -931,6 +908,17 @@ fn executeDownload(app: *r4os.App, state: *Runtime, work: *const core.Work) core
     const files = app.files() orelse return downloadFailure(&ctx, state, contract.result_download_failed, "files-unavailable", false);
     if (!state.download.valid or !state.download.record.valid() or state.download.record.job_id != work.job_id)
         return downloadFailure(&ctx, state, contract.result_selection_stale, "download-snapshot-missing", false);
+    state.config = loadConfig(&ctx);
+    if (!state.config.valid) return downloadFailure(&ctx, state, contract.result_invalid, "config-invalid", false);
+    switch (authenticate(app, &state.config, false)) {
+        .ok => {},
+        .cancelled => return cancelledCompletion(),
+        .credentials_missing => return downloadFailure(&ctx, state, contract.result_auth_failed, "registration-credentials-missing", false),
+        .invalid_target => return downloadFailure(&ctx, state, contract.result_invalid, "server-target-invalid", false),
+        .bad_response => return downloadFailure(&ctx, state, contract.result_auth_failed, "registration-invalid-response", false),
+        .service_unavailable => return downloadFailure(&ctx, state, contract.result_not_ready, "server-access-unavailable", false),
+        .network_failure => return downloadFailure(&ctx, state, contract.result_network_failed, "registration-network-failed", false),
+    }
     const paths = buildDownloadPaths(&state.download.record) orelse
         return downloadFailure(&ctx, state, contract.result_invalid, "download-path-invalid", false);
 
@@ -1009,6 +997,12 @@ fn executeDownload(app: *r4os.App, state: *Runtime, work: *const core.Work) core
         );
         switch (result) {
             .response => |response| {
+                if (response.status == 401)
+                    return downloadFailure(&ctx, state, contract.result_auth_failed, "download-registration-required", false);
+                if (response.status == 403)
+                    return downloadFailure(&ctx, state, contract.result_access_warning, "download-blocked-or-forbidden", false);
+                if (response.status == 429)
+                    return downloadFailure(&ctx, state, contract.result_network_failed, "download-rate-limited", false);
                 // WebTransport may resume one interrupted response internally.
                 // Its final wire response is then 206 even when this operation
                 // started at offset zero; each attempt has already passed the
@@ -1703,32 +1697,20 @@ fn loadConfig(ctx: *const r4os.r4sys.Context) ServiceConfig {
     if (!textEquals(schema, "R4OS_UPDATE_CLIENT")) return .{};
 
     var config = ServiceConfig{};
-    const server = document.value("SERVER") orelse return config;
-    const catalog_url = document.value("CATALOG_URL") orelse return config;
-    const key = document.value("MAGIC_KEY") orelse return config;
     const channel = document.value("CHANNEL") orelse return config;
-    const auth_port = document.u32Value("AUTH_PORT") orelse return config;
-    const update_port = document.u32Value("UPDATE_PORT") orelse return config;
-    const parsed_catalog = switch (r4os.http.parseUrl(catalog_url)) {
-        .value => |value| value,
-        .failure => return config,
-    };
-    if (!validServerHost(server) or !validHttpsUrl(catalog_url) or parsed_catalog.scheme != .https or
-        !std.ascii.eqlIgnoreCase(server, parsed_catalog.host) or !validMagicKey(key) or channel.len == 0 or channel.len > config.channel.len or
-        auth_port == 0 or auth_port > 65535 or update_port == 0 or update_port > 65535)
-        return config;
-
-    config.server_len = copyFixed(config.server[0..], server);
-    config.catalog_url_len = copyFixed(config.catalog_url[0..], catalog_url);
-    config.magic_key_len = copyFixed(config.magic_key[0..], key);
+    if (channel.len == 0 or channel.len > config.channel.len) return config;
     config.channel_len = copyFixed(config.channel[0..], channel);
-    config.auth_port = @intCast(auth_port);
-    config.update_port = @intCast(update_port);
     config.enabled = document.boolValue("ENABLED") orelse true;
-    config.connect_timeout_ms = document.u32Value("CONNECT_TIMEOUT_MS") orelse 5000;
     config.request_timeout_ms = document.u32Value("REQUEST_TIMEOUT_MS") orelse 30000;
     config.allow_redirects = document.boolValue("ALLOW_REDIRECTS") orelse false;
-    config.valid = config.enabled and config.connect_timeout_ms > 0 and config.request_timeout_ms > 0;
+    if (!config.enabled or config.request_timeout_ms == 0) return config;
+    _ = r4os.server_profile.load(ctx) catch return config;
+    const target = r4os.server_targets.read(ctx, .updates) catch return config;
+    const url = std.fmt.bufPrint(&config.catalog_url, "https://{s}:{d}/catalog.json", .{ target.host(), target.port }) catch return config;
+    config.catalog_url_len = url.len;
+    config.target_ip = target.ip.octets;
+    config.port = target.port;
+    config.valid = true;
     return config;
 }
 
@@ -1833,78 +1815,6 @@ fn decodeStruct(comptime T: type, bytes: []const u8) ?T {
     const out: [*]u8 = @ptrCast(&value);
     @memcpy(out[0..@sizeOf(T)], bytes);
     return value;
-}
-
-fn validMagicKey(value: []const u8) bool {
-    if (value.len != 34 or value[0] != '0' or (value[1] != 'x' and value[1] != 'X')) return false;
-    for (value[2..]) |ch| if (!isHex(ch)) return false;
-    return true;
-}
-
-fn isHex(ch: u8) bool {
-    return (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
-}
-
-fn validIpv4(value: []const u8) bool {
-    var parts: u8 = 0;
-    var digits: u8 = 0;
-    var number: u16 = 0;
-    for (value) |ch| {
-        if (ch >= '0' and ch <= '9') {
-            digits += 1;
-            if (digits > 3) return false;
-            number = number * 10 + (ch - '0');
-            if (number > 255) return false;
-        } else if (ch == '.' and digits != 0 and parts < 3) {
-            parts += 1;
-            digits = 0;
-            number = 0;
-        } else return false;
-    }
-    return parts == 3 and digits != 0;
-}
-
-fn validServerHost(value: []const u8) bool {
-    if (validIpv4(value)) return true;
-    if (value.len == 0 or value.len > 63 or value[0] == '.' or value[value.len - 1] == '.') return false;
-    var label_len: usize = 0;
-    for (value) |byte| {
-        if (byte == '.') {
-            if (label_len == 0) return false;
-            label_len = 0;
-        } else if ((byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9') or byte == '-') {
-            label_len += 1;
-            if (label_len > 63) return false;
-        } else return false;
-    }
-    return label_len != 0;
-}
-
-fn parseIpv4(value: []const u8) ?r4os.Ipv4Address {
-    if (!validIpv4(value)) return null;
-    var octets: [4]u8 = undefined;
-    var index: usize = 0;
-    var number: u16 = 0;
-    for (value) |byte| {
-        if (byte == '.') {
-            octets[index] = @intCast(number);
-            index += 1;
-            number = 0;
-        } else {
-            number = number * 10 + (byte - '0');
-        }
-    }
-    octets[index] = @intCast(number);
-    return r4os.Ipv4Address.fromBytes(octets);
-}
-
-fn validHttpsUrl(value: []const u8) bool {
-    if (value.len <= "https://".len or value.len > update_catalog.max_download_url_bytes or
-        !startsWithIgnoreCase(value, "https://")) return false;
-    for (value) |byte| {
-        if (byte <= ' ' or byte >= 0x7f or byte == '\\' or byte == '#') return false;
-    }
-    return true;
 }
 
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
