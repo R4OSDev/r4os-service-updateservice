@@ -1,7 +1,7 @@
 R4OS_MODULE_MANIFEST=2
 KIND=R4X
 NAME=UPDSVC
-VERSION=0.2.32
+VERSION=0.2.33
 LANGUAGE=Zig
 SOURCE=src/main.zig
 ZIG_MODULE=system_update_engine:../../SDK/r4os/system_update_engine.zig
@@ -35,6 +35,7 @@ META=feature=bounded-update-io-retry
 META=feature=bounded-stage-abort-retry
 META=feature=cached-offer-snapshot-rebind
 META=feature=exact-status-row-binding
+META=feature=chosen-application-inventory-targets
 IMPORT=R4STD:SETTINGS_V1:1
 IMPORT=R4STD:CONFIG_V1:1
 ZIG_MODULE=r4std:../../Libraries/R4STD/Bindings/Zig/r4std.zig
