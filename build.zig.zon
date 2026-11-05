@@ -1,12 +1,12 @@
 .{
     .name = .r4os_updsvc,
-    .version = "0.2.33",
+    .version = "0.2.34",
     .fingerprint = 0x35591db65d062b63,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .r4os_sdk = .{
-            .url = "https://github.com/R4OSDev/r4os-sdk/archive/7818dc87b0202ff4425d86cc9c0d868538f0b660.tar.gz",
-            .hash = "r4os_sdk-0.64.150-NnPzAsGL7AE1O-Zi8g55uRfiDldkgF8Jp1_N1FXVyJH_",
+            .url = "https://github.com/R4OSDev/r4os-sdk/archive/dcb85a7aa5a128f4025a1a1e065fd70347fb3d43.tar.gz",
+            .hash = "r4os_sdk-0.64.151-NnPzArDU7AGQO-WDV0mLZ8kpxFEehozyTbXIzGa0OuD-",
         },
         .r4os_libraries = .{
             .url = "https://github.com/R4OSDev/r4os-libraries/archive/b2cc58fe66d0d8cabab1232cfb8a545e54a9df31.tar.gz",
