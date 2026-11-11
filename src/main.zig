@@ -67,7 +67,7 @@ const DownloadRuntime = struct {
 };
 
 const Runtime = struct {
-    app: ?*r4os.App = null,
+    app: ?*r4os.App2 = null,
     coordinator: core.Coordinator = .{},
     config: ServiceConfig = .{},
     stop: r4os.app_contract.StopFlag = .{},
@@ -84,15 +84,16 @@ const Runtime = struct {
 
 var runtime: Runtime = .{};
 
-pub fn r4_app_main(app: *r4os.App) i32 {
-    if (!r4std.init(app.startContext())) return r4os.abi.err_no_group;
-    if (hasArg(app.args(), selftest_arg)) return runSelfTest(app);
+pub fn r4_app_main(app: *r4os.App2) i32 {
+    if (!r4std.init2(app.raw)) return r4os.abi.err_no_group;
+    if (hasSelfTestArg(app.args()) catch |err| return r4os.arguments.code(err)) return runSelfTest(app);
     return runService(app);
 }
 
-fn runService(app: *r4os.App) i32 {
+fn runService(app: *r4os.App2) i32 {
     const ctx = app.system();
     const services = app.services() orelse return r4os.abi.service_api_result_invalid;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(&app.context) catch return r4os.abi.err_no_fn;
     const resources = app.resources();
     if (!resources.available()) return r4os.abi.thread_error_unsupported;
 
@@ -106,6 +107,7 @@ fn runService(app: *r4os.App) i32 {
     };
     const loaded_config = loadConfig(&ctx);
     runtime.app = app;
+    defer runtime.app = null;
     runtime.coordinator = core.Coordinator.init(loaded_config.valid);
     runtime.config = loaded_config;
     runtime.stop = .{};
@@ -148,48 +150,81 @@ fn runService(app: *r4os.App) i32 {
         },
     };
 
-    var endpoint = registerEndpoint(&ctx, &services) orelse {
-        @atomicStore(u32, &runtime.shutdown, 1, .release);
-        _ = worker.join(r4os.time_contract.timeoutForever());
-        return r4os.abi.service_api_result_no_endpoint;
-    };
-
-    ctx.println("UPDSVC ready endpoint=UPDSVC worker=1 contract=1");
-    var service_loop = r4os.ServiceLoop.init(ctx, endpoint.raw, .{});
-    while (true) {
-        switch (service_loop.wait(null)) {
-            .requests => |pending| {
-                const rc = service_loop.drain(pending, handleRequest, .{ &ctx, &endpoint });
-                if (rc >= 0) continue;
-                _ = endpoint.unregister();
-                @atomicStore(u32, &runtime.shutdown, 1, .release);
-                runtime.stop.request();
-                _ = worker.join(r4os.time_contract.timeoutForever());
-                return rc;
-            },
-            .idle, .deadline => {},
-            .stop => break,
-            .failure => |raw| {
-                @atomicStore(u32, &runtime.shutdown, 1, .release);
-                runtime.stop.request();
-                _ = worker.join(r4os.time_contract.timeoutForever());
-                return raw;
-            },
-        }
-    }
-
-    service_loop.report(std.mem.span(contract.service_name));
+    const served = serve(&ctx, &services, clock.read);
     runtime.coordinator.stop();
     runtime.stop.request();
     @atomicStore(u32, &runtime.shutdown, 1, .release);
     if (snapshotBlocking(&ctx)) |status| _ = persistStatus(&ctx, status);
-    _ = endpoint.unregister();
-    _ = worker.join(r4os.time_contract.timeoutForever());
+    const worker_exit = retireWorker(app, &ctx, &worker.handle);
+    if (served != 0) return served;
+    if (worker_exit != 0) return worker_exit;
     ctx.println("UPDSVC stopped cleanly");
     return 0;
 }
 
-fn finishPostBootBatch(app: *r4os.App) void {
+fn serve(ctx: *const r4os.r4sys.Context, services: *const r4os.Services, clock: r4os.rpc_budget.Clock) i32 {
+    var budget = r4os.rpc_budget.Budget.fromTicks(clock, 100) catch |err| return r4os.rpc_budget.code(err);
+    var endpoint = switch (r4os.app_services.registerUntil(services, contract.service_name, 0, &budget)) {
+        .endpoint => |value| value,
+        .failure => |raw| return raw,
+    };
+    defer _ = endpoint.unregister();
+    ctx.println("UPDSVC ready endpoint=UPDSVC worker=1 contract=1");
+    var loop = r4os.ServiceLoop.init(ctx.*, endpoint.raw, .{});
+    while (true) {
+        switch (loop.wait(null)) {
+            .requests => |pending| {
+                const rc = loop.drain(pending, handleRequest, .{ ctx, &endpoint });
+                if (rc < 0) return rc;
+            },
+            .idle, .deadline => {},
+            .stop => break,
+            .failure => |raw| return raw,
+        }
+    }
+    loop.report(std.mem.span(contract.service_name));
+    return 0;
+}
+
+fn retireWorker(app: *const r4os.App2, ctx: *const r4os.r4sys.Context, handle: *r4os.abi.ProgramJoinHandle) i32 {
+    const wait = r4os.wait_set;
+    var set: wait.Set = undefined;
+    const opened = wait.Set.init(&app.context, 1, &set) == 0;
+    defer if (opened) {
+        while (set.handle != 0 and set.close() != 0) ctx.sleepTicks(1);
+    };
+    var source: wait.Source = .{};
+    var registration: u64 = 0;
+    const enrolled = opened and wait.prepare(&app.context, wait.thread(handle.*, 0), &source) == 0 and
+        set.enroll(source, &registration) == 0;
+    while (true) {
+        var worker_exit: i32 = 0;
+        var exact = handle.*;
+        if (ctx.threadHandleJoin(&exact, if (enrolled) 0 else r4os.abi.thread_wait_forever, &worker_exit) == r4os.abi.thread_ok) {
+            handle.* = .{};
+            return worker_exit;
+        }
+        if (enrolled) {
+            var events: [1]wait.Event = undefined;
+            var batch: wait.Batch = .{};
+            const timing = ctx.base.clockSampleChecked() catch {
+                ctx.sleepTicks(1);
+                continue;
+            };
+            const timeout = r4os.time_contract.checked.DeadlineBudget.init(timing, timeoutFromMs(100)) catch {
+                ctx.sleepTicks(1);
+                continue;
+            };
+            if (wait.deadline(timeout)) |limit| {
+                _ = set.wait(limit, &events, &batch);
+            } else |_| {}
+        }
+        // A wake or failure may precede physical thread cleanup.
+        ctx.sleepTicks(1);
+    }
+}
+
+fn finishPostBootBatch(app: *r4os.App2) void {
     var engine = update_engine.Engine.init(app);
     const status = engine.status();
     if (status.exit_code != 0 or (status.state != .pending_restart and status.state != .restart_required)) return;
@@ -199,18 +234,6 @@ fn finishPostBootBatch(app: *r4os.App) void {
         ctx.write("UPDSVC post-boot update finalization failed: ");
         ctx.println(resumed.reasonText());
     }
-}
-
-fn registerEndpoint(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) ?r4os.ServiceEndpoint {
-    var waited: u32 = 0;
-    while (waited < 100) : (waited += 1) {
-        switch (services.register(contract.service_name, 0)) {
-            .endpoint => |value| return value,
-            .failure => {},
-        }
-        ctx.sleepTicks(1);
-    }
-    return null;
 }
 
 fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint) i32 {
@@ -629,7 +652,7 @@ fn workerMain(arg: u64) callconv(.c) i32 {
     return 0;
 }
 
-fn executeWork(app: *r4os.App, state: *Runtime, work: core.Work) core.Completion {
+fn executeWork(app: *r4os.App2, state: *Runtime, work: core.Work) core.Completion {
     if (state.coordinator.cancelRequested() or state.stop.requested()) return cancelledCompletion();
     return switch (work.operation) {
         .install => executeInstall(app, state, &work),
@@ -640,7 +663,7 @@ fn executeWork(app: *r4os.App, state: *Runtime, work: core.Work) core.Completion
     };
 }
 
-fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.Completion {
+fn executeSearch(app: *r4os.App2, state: *Runtime, work: *const core.Work) core.Completion {
     const ctx = app.system();
     state.config = loadConfig(&ctx);
     if (!state.config.valid) return searchFailure(contract.result_invalid, "config-invalid");
@@ -662,13 +685,15 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
     @memset(state.results.offer_progress[0..], 0);
 
     if (state.coordinator.cancelRequested() or state.stop.requested()) return cancelledCompletion();
-    switch (authenticate(app, &state.config, false)) {
+    var budget = requestBudget(app, &state.config) catch return searchFailure(contract.result_network_failed, "request-clock-unavailable");
+    switch (authenticate(app, &state.config, &budget, false)) {
         .ok => {},
         .cancelled => return cancelledCompletion(),
         .credentials_missing => return searchFailure(contract.result_auth_failed, "registration-credentials-missing"),
         .invalid_target => return searchFailure(contract.result_invalid, "server-target-invalid"),
         .bad_response => return searchFailure(contract.result_auth_failed, "registration-invalid-response"),
         .service_unavailable => return searchFailure(contract.result_not_ready, "server-access-unavailable"),
+        .timed_out => return searchFailure(contract.result_network_failed, "registration-timeout"),
         .network_failure => return searchFailure(contract.result_network_failed, "registration-network-failed"),
     }
     if (state.coordinator.cancelRequested() or state.stop.requested()) return cancelledCompletion();
@@ -705,13 +730,14 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
     const response = read_catalog: {
         var retried_registration = false;
         while (true) {
+            const timeout = r4os.rpc_budget.remainingTimeout(&budget) catch return searchFailure(contract.result_network_failed, "catalog-timeout");
             const fetch = web.fetch(
                 state.config.catalog_url[0..state.config.catalog_url_len],
                 state.results.raw_response[0..],
                 state.results.catalog_bytes[0..],
                 state.results.tls_scratch[0..],
                 .{
-                    .timeout = timeoutFromMs(state.config.request_timeout_ms),
+                    .timeout = timeout,
                     .redirect = if (state.config.allow_redirects) .follow else .error_mode,
                     .redirect_limit = if (state.config.allow_redirects) 3 else 0,
                     .stop = &state.stop.storage,
@@ -731,13 +757,14 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
                 if (!registrationRequired(&devices, candidate.body))
                     return searchFailure(contract.result_auth_failed, "catalog-unauthorized");
                 if (retried_registration) return searchFailure(contract.result_access_warning, "registration-still-required");
-                switch (authenticate(app, &state.config, true)) {
+                switch (authenticate(app, &state.config, &budget, true)) {
                     .ok => {},
                     .cancelled => return cancelledCompletion(),
                     .credentials_missing => return searchFailure(contract.result_auth_failed, "registration-credentials-missing"),
                     .invalid_target => return searchFailure(contract.result_invalid, "server-target-invalid"),
                     .bad_response => return searchFailure(contract.result_auth_failed, "registration-invalid-response"),
                     .service_unavailable => return searchFailure(contract.result_not_ready, "server-access-unavailable"),
+                    .timed_out => return searchFailure(contract.result_network_failed, "registration-timeout"),
                     .network_failure => return searchFailure(contract.result_network_failed, "registration-network-failed"),
                 }
                 retried_registration = true;
@@ -803,19 +830,25 @@ fn executeSearch(app: *r4os.App, state: *Runtime, work: *const core.Work) core.C
     return searchCompletion(&state.results.plan);
 }
 
-const AuthResult = enum { ok, cancelled, credentials_missing, invalid_target, bad_response, service_unavailable, network_failure };
+const AuthResult = enum { ok, cancelled, credentials_missing, invalid_target, bad_response, service_unavailable, timed_out, network_failure };
 
-fn authenticate(app: *r4os.App, config: *const ServiceConfig, force: bool) AuthResult {
+fn requestBudget(app: *const r4os.App2, config: *const ServiceConfig) r4os.rpc_budget.Error!r4os.rpc_budget.Budget {
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(&app.context) catch return error.ClockUnavailable;
+    return r4os.rpc_budget.Budget.fromTimeout(clock.read, timeoutFromMs(config.request_timeout_ms));
+}
+
+fn authenticate(app: *const r4os.App2, config: *const ServiceConfig, budget: *r4os.rpc_budget.Budget, force: bool) AuthResult {
     if (runtime.stop.requested()) return .cancelled;
     const services = app.services() orelse return .service_unavailable;
     const client = r4os.server_access.Client{ .services = services };
-    const result = if (force)
-        client.retryAfterRegistrationRequired(.updates, runtime.registered_generation)
-    else
-        client.ensure(.updates);
+    var timeout = r4os.rpc_budget.remainingTimeout(budget) catch |err| return if (err == error.TimedOut) .timed_out else .network_failure;
+    timeout.nanoseconds = @min(timeout.nanoseconds, 15_000_000_000);
+    const result = client.ensureBounded(.updates, if (force) runtime.registered_generation else null, timeout);
+    if (runtime.stop.requested()) return .cancelled;
     const response = switch (result) {
         .response => |value| value,
-        .unavailable, .timed_out, .malformed => return .service_unavailable,
+        .timed_out => return .timed_out,
+        .unavailable, .malformed => return .service_unavailable,
     };
     if (response.code != @intFromEnum(r4os.server_access.Code.ok)) {
         if (response.code == @intFromEnum(r4os.server_access.Code.credentials)) return .credentials_missing;
@@ -864,23 +897,36 @@ const DownloadPaths = struct {
 const DownloadFlow = struct {
     ctx: *const r4os.r4sys.Context,
     state: *Runtime,
-    paths: *const DownloadPaths,
     job_id: u32,
     current: u64,
     last_checkpoint: u64,
     digest: *update_download.TransferDigest,
+    clock: r4os.stream_transfer.adapters.PlatformClock,
+    writer: r4os.stream_transfer.adapters.FileAppend,
+    deadline: r4os.time_contract.checked.DeadlineBudget,
     persist_failed: bool = false,
 
     fn write(raw: ?*anyopaque, offset: u64, bytes: []const u8) bool {
         const self: *DownloadFlow = @ptrCast(@alignCast(raw orelse return false));
-        if (offset != self.current or bytes.len == 0 or self.current + bytes.len > self.state.download.record.expected_size)
+        if (offset != self.current or bytes.len == 0 or bytes.len > self.state.download.record.expected_size -| self.current)
             return false;
-        const written = self.ctx.fileAppend(self.paths.part.asZ().ptr, bytes);
-        if (written < 0 or @as(usize, @intCast(written)) != bytes.len) return false;
-        self.digest.append(bytes);
-        self.current += bytes.len;
-        self.state.download.record.progress = self.current;
-        return true;
+        const stream = r4os.stream_transfer;
+        var transfer = stream.Transfer.initAbsolute(.write_all, bytes.len, self.deadline) catch return false;
+        while (true) {
+            const start: usize = @intCast(transfer.bytes);
+            const step = transfer.writeStep(bytes[start..], download_io_capacity, self.state.stop.requested() or self.state.coordinator.cancelRequested(), stream.adapters.PlatformClock.sample, &self.clock, stream.adapters.FileAppend.step, &self.writer) catch return false;
+            self.deadline = transfer.deadline;
+            if (step.last_bytes != 0) {
+                self.digest.append(bytes[start..][0..step.last_bytes]);
+                self.current += step.last_bytes;
+                self.state.download.record.progress = self.current;
+            }
+            switch (@as(stream.Outcome, @enumFromInt(step.outcome))) {
+                .complete => return true,
+                .pending => {},
+                else => return false,
+            }
+        }
     }
 
     fn progress(raw: ?*anyopaque, current: u64, total: u64) bool {
@@ -902,20 +948,22 @@ const DownloadFlow = struct {
     }
 };
 
-fn executeDownload(app: *r4os.App, state: *Runtime, work: *const core.Work) core.Completion {
+fn executeDownload(app: *r4os.App2, state: *Runtime, work: *const core.Work) core.Completion {
     const ctx = app.system();
     const files = app.files() orelse return downloadFailure(&ctx, state, contract.result_download_failed, "files-unavailable", false);
     if (!state.download.valid or !state.download.record.valid() or state.download.record.job_id != work.job_id)
         return downloadFailure(&ctx, state, contract.result_selection_stale, "download-snapshot-missing", false);
     state.config = loadConfig(&ctx);
     if (!state.config.valid) return downloadFailure(&ctx, state, contract.result_invalid, "config-invalid", false);
-    switch (authenticate(app, &state.config, false)) {
+    var budget = requestBudget(app, &state.config) catch return downloadFailure(&ctx, state, contract.result_network_failed, "request-clock-unavailable", false);
+    switch (authenticate(app, &state.config, &budget, false)) {
         .ok => {},
         .cancelled => return cancelledCompletion(),
         .credentials_missing => return downloadFailure(&ctx, state, contract.result_auth_failed, "registration-credentials-missing", false),
         .invalid_target => return downloadFailure(&ctx, state, contract.result_invalid, "server-target-invalid", false),
         .bad_response => return downloadFailure(&ctx, state, contract.result_auth_failed, "registration-invalid-response", false),
         .service_unavailable => return downloadFailure(&ctx, state, contract.result_not_ready, "server-access-unavailable", false),
+        .timed_out => return downloadFailure(&ctx, state, contract.result_network_failed, "registration-timeout", false),
         .network_failure => return downloadFailure(&ctx, state, contract.result_network_failed, "registration-network-failed", false),
     }
     const paths = buildDownloadPaths(&state.download.record) orelse
@@ -966,14 +1014,18 @@ fn executeDownload(app: *r4os.App, state: *Runtime, work: *const core.Work) core
         return downloadFailure(&ctx, state, contract.result_integrity_failed, "partial-read-failed", false);
     if (resume_from < state.download.record.expected_size) {
         var web = app.web() orelse return downloadFailure(&ctx, state, contract.result_network_failed, "web-unavailable", false);
+        const timeout = r4os.rpc_budget.remainingTimeout(&budget) catch return downloadFailure(&ctx, state, contract.result_network_failed, "download-timeout", false);
+        const adapters = r4os.stream_transfer.adapters;
         var flow = DownloadFlow{
             .ctx = &ctx,
             .state = state,
-            .paths = &paths,
             .job_id = work.job_id,
             .current = resume_from,
             .last_checkpoint = resume_from,
             .digest = &digest,
+            .deadline = budget.deadline,
+            .clock = adapters.PlatformClock.fromContext2(&app.context) catch return downloadFailure(&ctx, state, contract.result_download_failed, "download-clock-unavailable", false),
+            .writer = adapters.FileAppend.fromContext2(&app.context, paths.part.asZ().ptr) catch return downloadFailure(&ctx, state, contract.result_download_failed, "download-append-unavailable", false),
         };
         const result = web.download(
             state.download.record.urlText(),
@@ -982,7 +1034,7 @@ fn executeDownload(app: *r4os.App, state: *Runtime, work: *const core.Work) core
             state.download.scratch[0..],
             .{ .context = &flow, .write_fn = DownloadFlow.write },
             .{
-                .timeout = timeoutFromMs(state.config.request_timeout_ms),
+                .timeout = timeout,
                 .redirect_limit = if (state.config.allow_redirects) 3 else 0,
                 .stop = &state.stop.storage,
                 .progress = DownloadFlow.progress,
@@ -1337,7 +1389,7 @@ fn selectedLiveReleaseBinding(
     return binding;
 }
 
-fn executeInstall(app: *r4os.App, state: *Runtime, work: *const core.Work) core.Completion {
+fn executeInstall(app: *r4os.App2, state: *Runtime, work: *const core.Work) core.Completion {
     const ctx = app.system();
     const path = work.request.selectionText() orelse return invalidCompletion("invalid-path");
     if (path.len == 0 or path.len > r4os.path.file_path_max) return invalidCompletion("invalid-path");
@@ -1404,7 +1456,7 @@ fn executeInstall(app: *r4os.App, state: *Runtime, work: *const core.Work) core.
     return completion;
 }
 
-fn executeUpdateAll(app: *r4os.App, state: *Runtime, work: *const core.Work) core.Completion {
+fn executeUpdateAll(app: *r4os.App2, state: *Runtime, work: *const core.Work) core.Completion {
     const ctx = app.system();
     if (work.source_job_id == 0 or state.results.job_id != work.source_job_id or state.results.plan.package_count == 0)
         return invalidCompletion("update-all-snapshot-stale");
@@ -1548,7 +1600,7 @@ fn executeUpdateAll(app: *r4os.App, state: *Runtime, work: *const core.Work) cor
     };
 }
 
-fn executeRestart(app: *r4os.App, state: *Runtime, work: *const core.Work) core.Completion {
+fn executeRestart(app: *r4os.App2, state: *Runtime, work: *const core.Work) core.Completion {
     if (!state.prepared_restart or state.prepared_search_job_id != work.source_job_id)
         return invalidCompletion("restart-batch-not-ready");
     var engine = update_engine.Engine.init(app);
@@ -1598,7 +1650,7 @@ fn packageInboxPath(result_index: usize) ?r4os.AbsoluteFilePath {
     return (buildDownloadPathsForFilename(runtime.results.release.packages[package_index].filename) orelse return null).final;
 }
 
-fn targetReleaseReached(app: *r4os.App, state: *Runtime) bool {
+fn targetReleaseReached(app: *r4os.App2, state: *Runtime) bool {
     const ctx = app.system();
     var lock_attempt: u32 = 0;
     while (!tryAcquireResultsLock()) : (lock_attempt += 1) {
@@ -1933,29 +1985,16 @@ fn registrationRequired(dev: *const r4os.r4dev.Context, body: []const u8) bool {
     return textEquals(value, "registration_required");
 }
 
-fn hasArg(args: []const u8, wanted: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < args.len and args[offset] != 0) {
-        while (offset < args.len and (args[offset] == ' ' or args[offset] == '\t')) : (offset += 1) {}
-        const start = offset;
-        while (offset < args.len and args[offset] != 0 and args[offset] != ' ' and args[offset] != '\t') : (offset += 1) {}
-        if (textEqualsIgnoreCase(args[start..offset], wanted)) return true;
+fn hasSelfTestArg(args: []const u8) r4os.arguments.Error!bool {
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = try r4os.arguments.ArgCursor.init(args, .{ .quotes = @intFromEnum(r4os.arguments.Quotes.none) }, &failure);
+    while (try cursor.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(try token.bytes(args), selftest_arg)) return true;
     }
     return false;
 }
 
-fn textEqualsIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| if (upper(left) != upper(right)) return false;
-    return true;
-}
-
-fn upper(ch: u8) u8 {
-    if (ch >= 'a' and ch <= 'z') return ch - ('a' - 'A');
-    return ch;
-}
-
-fn runSelfTest(app: *r4os.App) i32 {
+fn runSelfTest(app: *r4os.App2) i32 {
     var coordinator = core.Coordinator.init(true);
     const accepted = coordinator.submit(contract.op_search, .{});
     const job_id = switch (accepted) {
@@ -1973,7 +2012,7 @@ fn runSelfTest(app: *r4os.App) i32 {
     return 0;
 }
 
-fn selfTestFail(app: *r4os.App, reason: []const u8) i32 {
+fn selfTestFail(app: *r4os.App2, reason: []const u8) i32 {
     app.system().write("UPDSVC selftest FAILED: ");
     app.system().println(reason);
     return 1;

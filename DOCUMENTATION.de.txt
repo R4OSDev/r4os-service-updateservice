@@ -94,3 +94,10 @@ Drei kurze Hostfaelle pruefen einen gezielten Abschlusskonflikt, kopierte
 Abschlusstexte und Folgearbeit, die Oberflaechenbindung sowie die gemeinsame
 Vorbereiten/Suchversuch/Neustart/Wiederholungsfolge. Keine echte Installation.
 Die beiden Besitzerartefakte sind UPDSVC0.2.20 und UpdateCenter0.2.5.
+
+UPDSVC0.2.36 initialisiert R4STD ueber den echten Start2-Kontext. SETTINGS_V1
+und CONFIG_V1 sind eigene benannte Tabellen. Ein Auftragsbudget begrenzt
+Registrierung, TLS und HTTP samt bedingter Wiederholung. Bestaetigte
+Dateibytes bilden das Praefix fuer den naechsten Range-Abruf und den
+SHA-256-Zustand. Der Hauptthread haelt den Startkontext bis zum
+bestaetigten Worker-Join. Eine WaitSet-Quelle weckt ihn fuer diesen Join.

@@ -1,16 +1,16 @@
 .{
     .name = .r4os_updsvc,
-    .version = "0.2.34",
+    .version = "0.2.36",
     .fingerprint = 0x35591db65d062b63,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .r4os_sdk = .{
-            .url = "https://github.com/R4OSDev/r4os-sdk/archive/d698b2c724691cbfb8163c4e9730e4988e655c08.tar.gz",
-            .hash = "r4os_sdk-0.64.152-NnPzAlVG7QFcgjmjZgTt1ZqkrCeYwUlyG8bzrmPwt53e",
+            .url = "https://github.com/R4OSDev/r4os-sdk/archive/c7ddaa51189fc2ae80898053086d6c541050def3.tar.gz",
+            .hash = "r4os_sdk-0.64.199-NnPzAqy3CwKg94WgFFlke-w1zqYTNCzgaiCN7V7R-E3-",
         },
         .r4os_libraries = .{
-            .url = "https://github.com/R4OSDev/r4os-libraries/archive/b2cc58fe66d0d8cabab1232cfb8a545e54a9df31.tar.gz",
-            .hash = "r4os_libraries-0.64.49-dH4fNSAUeAOaX_xUskH-d9PrEN_ylVC8VJ-zFOHlJUWD",
+            .url = "https://github.com/R4OSDev/r4os-libraries/archive/a45419c21ff78699d2a5599615b7c09aefa9fbe9.tar.gz",
+            .hash = "r4os_libraries-0.64.56-dH4fNU-WewNliHU_Xt4JeUaDx--FxuHeDmsW1NqITRs4",
         },
     },
     .paths = .{

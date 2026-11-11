@@ -1,8 +1,9 @@
 R4OS_MODULE_MANIFEST=2
 KIND=R4X
 NAME=UPDSVC
-VERSION=0.2.35
+VERSION=0.2.36
 LANGUAGE=Zig
+SDK_PROFILE=r4os-zig-generation2
 SOURCE=src/main.zig
 ZIG_MODULE=system_update_engine:../../SDK/r4os/system_update_engine.zig
 ZIG_MODULE=update_service_contract:../../SDK/r4os/update_service_contract.zig
@@ -10,9 +11,9 @@ ENTRY_MODE=app
 APP_CLASS=service
 TARGET=/R4OS/SERVICES/UPDSVC.R4X
 IMAGE_SCOPE=slim
-IMPORT=R4NET:Query:1
-IMPORT=R4DEV:Query:1
-IMPORT=R4SYS:Query:1
+IMPORT=R4NET:Query2:2
+IMPORT=R4DEV:Query2:2
+IMPORT=R4SYS:Query2:2
 META=service.name=UPDSVC
 META=service.args=/RUN
 META=service.start=auto
@@ -38,4 +39,5 @@ META=feature=exact-status-row-binding
 META=feature=chosen-application-inventory-targets
 IMPORT=R4STD:SETTINGS_V1:1
 IMPORT=R4STD:CONFIG_V1:1
+IMPORT=R4STD:Query2:2
 ZIG_MODULE=r4std:../../Libraries/R4STD/Bindings/Zig/r4std.zig
